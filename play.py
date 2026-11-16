@@ -42,11 +42,15 @@ from utils import (
 )
 from libinput_backend import (
     LibinputUnavailableError,
-    choose_devices,
+    LibinputActivityMonitor,
     count_event_frames,
+    has_takeover_input,
     merge_recording_suffix,
+    recording_duration_seconds,
+    resolve_recording_devices,
     start_recording as start_libinput_recording,
     start_replay as start_libinput_replay,
+    start_replay_at_user_boundary,
     stop_recording as stop_libinput_recording,
     stop_replay as stop_libinput_replay,
     sudo_warmup,
@@ -57,14 +61,15 @@ XTEST_SLAVE_ID_FALLBACK = 4
 
 DEFAULT_RETRY_IMG = Path("data/retry.png")
 DEFAULT_SKIP_IMG = Path("data/skip.png")
+DEFAULT_HEAL_IMG = Path("data/heal.png")
+DEFAULT_COMPLETED_IMG = Path("data/completed.png")
+DEFAULT_FAILED_IMG = Path("data/failed.png")
 DEFAULT_RETRY_COORDS = (1154, 847)
 DEFAULT_SKIP_COORDS = (1802, 1028)
 
 def _overlay_process_target(state_queue: mp.Queue):
     """
-    Transparent, click-through HUD overlay (top-right).
-    Green = CAPTURING, Red = NOT DETECTED.
-    Only shown during active recording takeover.
+    Persistent click-through HUD showing playback status and recent button events.
     """
     import tkinter as tk
 
@@ -81,10 +86,11 @@ def _overlay_process_target(state_queue: mp.Queue):
         root.geometry(f"{w}x{h}+{x}+{y}")
         root.configure(bg="#000000")
 
-        frame = tk.Frame(root, bg="#1a0000", highlightthickness=2, highlightbackground="#FF0000")
+        frame = tk.Frame(root, bg="#101820", highlightthickness=1, highlightbackground="#4A90E2")
         frame.pack(expand=True, fill="both")
-        label = tk.Label(frame, text="● NOT DETECTED", font=("Ubuntu", 11, "bold"),
-                         fg="#FF0000", bg="#1a0000", padx=10, pady=4)
+        label = tk.Label(frame, text="READY", font=("Ubuntu", 8, "bold"),
+                         fg="#FFFFFF", bg="#101820", anchor="w", justify="left",
+                         padx=5, pady=0, wraplength=166)
         label.pack(expand=True, fill="both")
         root.update_idletasks()
 
@@ -104,22 +110,50 @@ def _overlay_process_target(state_queue: mp.Queue):
         except Exception:
             pass
 
+        log_lines = []
+        countdown_deadline = None
+        status_text = "READY"
+
         def check_queue():
+            nonlocal countdown_deadline, status_text
             try:
-                while not state_queue.empty():
+                while True:
                     msg = state_queue.get_nowait()
-                    if msg == "RECORDING":
-                        label.configure(text="● CAPTURING", fg="#00FF00", bg="#001a00")
-                        frame.configure(bg="#001a00", highlightbackground="#00FF00")
-                    elif msg == "STOPPED":
-                        label.configure(text="● NOT DETECTED", fg="#FF0000", bg="#1a0000")
-                        frame.configure(bg="#1a0000", highlightbackground="#FF0000")
-                    elif msg == "EXIT":
+                    if msg[0] == "EXIT":
                         root.destroy()
                         return
+                    if msg[0] == "STATUS":
+                        countdown_deadline = None
+                        status_text = msg[1][:24]
+                        if status_text.startswith("RECORDING"):
+                            label.configure(fg="#00FF88")
+                            frame.configure(highlightbackground="#00FF88")
+                        elif status_text.startswith("SKIP") or status_text.startswith("RETRY"):
+                            label.configure(fg="#FFD166")
+                            frame.configure(highlightbackground="#FFD166")
+                        else:
+                            label.configure(fg="#FFFFFF")
+                            frame.configure(highlightbackground="#4A90E2")
+                    elif msg[0] == "PLAYING":
+                        countdown_deadline = time.monotonic() + max(0.0, float(msg[2]))
+                        macro_name = msg[1]
+                        short_name = macro_name if len(macro_name) <= 14 else macro_name[:13] + "…"
+                        status_text = f"PLAY: {short_name}"
+                        label.configure(fg="#FFFFFF")
+                        frame.configure(highlightbackground="#4A90E2")
+                    elif msg[0] == "LOG":
+                        log_lines.append(msg[1])
+                        del log_lines[:-4]
             except Exception:
                 pass
-            root.after(40, check_queue)
+            if countdown_deadline is not None:
+                remaining = max(0, int(countdown_deadline - time.monotonic() + 0.999))
+                countdown_text = f"Ends in {remaining // 60:02d}:{remaining % 60:02d}"
+            else:
+                countdown_text = ""
+            last_log = log_lines[-1].split("  ", 1)[-1] if log_lines else ""
+            label.configure(text="\n".join(part for part in (status_text, countdown_text, last_log) if part))
+            root.after(100, check_queue)
 
         root.after(40, check_queue)
         try:
@@ -151,17 +185,33 @@ class ScreenOverlay:
             except Exception as e:
                 print(f"[!] Overlay start failed: {e}")
 
+    def set_status(self, status: str):
+        self._send(("STATUS", status))
+
+    def set_playing(self, name: str, duration: float):
+        self._send(("PLAYING", name, max(0.0, duration)))
+
+    def log_event(self, message: str):
+        self._send(("LOG", f"{datetime.now().strftime('%H:%M:%S')}  {message}"))
+
     def set_recording(self, recording: bool):
+        if recording:
+            self.log_event("RECORDING")
+            self.set_status("RECORDING")
+        else:
+            self.set_status("READY")
+
+    def _send(self, message):
         if self._started:
             try:
-                self.queue.put_nowait("RECORDING" if recording else "STOPPED")
+                self.queue.put_nowait(message)
             except Exception:
                 pass
 
     def close(self):
         if self._started:
             try:
-                self.queue.put_nowait("EXIT")
+                self.queue.put_nowait(("EXIT",))
                 self.process.join(timeout=0.5)
             except Exception:
                 pass
@@ -208,6 +258,23 @@ class SequenceEntry:
         except json.JSONDecodeError:
             raise ValueError(f"Corrupted or incomplete JSON in '{json_path}'. Please re-record.") from None
 
+        try:
+            recorded_duration = float(self.metadata.get("duration_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            recorded_duration = 0.0
+        if self.native_recording:
+            event_duration = recording_duration_seconds(json_path)
+            if event_duration > 0:
+                recorded_duration = event_duration
+        elif self.events:
+            try:
+                event_duration = max(float(event.get("time", 0.0) or 0.0) for event in self.events)
+                if event_duration > 0:
+                    recorded_duration = event_duration
+            except (AttributeError, TypeError, ValueError):
+                pass
+        self.duration_seconds = max(0.0, recorded_duration)
+
         # Load all trigger templates (supports multi-template folders like data/start/1/)
         self.templates_gray: List[Tuple[str, np.ndarray]] = []
 
@@ -233,6 +300,7 @@ class SequenceEntry:
                 inferred_phase = 2
 
         if inferred_phase in (1, 2):
+            self.phase_hint = inferred_phase
             phase_dir = START_DIR / str(inferred_phase)
             if phase_dir.is_dir():
                 for p in sorted(phase_dir.iterdir()):
@@ -240,6 +308,8 @@ class SequenceEntry:
                         t = ScreenMatcher.load_template_gray(p)
                         if t is not None and not any(name.endswith(p.name) for name, _ in self.templates_gray):
                             self.templates_gray.append((f"phase{inferred_phase}/{p.name}", t))
+        else:
+            self.phase_hint = None
 
         # 3. Check metadata saved start image (file or directory)
         saved = self.metadata.get("start_image")
@@ -291,6 +361,7 @@ class InputPlayer:
         monitor_idx: int = 1,
         dry_run: bool = False,
         mouse_mode: str = "relative",
+        allow_takeover: bool = False,
     ):
         self.threshold = threshold
         self.check_interval = max(0.005, 1.0 / max(1.0, fps))
@@ -300,6 +371,7 @@ class InputPlayer:
         self.monitor_idx = monitor_idx
         self.dry_run = dry_run
         self.mouse_mode = mouse_mode.lower()
+        self.allow_takeover = allow_takeover
 
         # Retry and Skip configuration
         self.retry_path = Path(retry_img)
@@ -312,9 +384,26 @@ class InputPlayer:
         if self.retry_path.is_file():
             self.retry_template = ScreenMatcher.load_template_gray(self.retry_path)
 
+        self.completed_path = DEFAULT_COMPLETED_IMG
+        self.completed_template: Optional[np.ndarray] = (
+            ScreenMatcher.load_template_gray(self.completed_path)
+            if self.completed_path.is_file() else None
+        )
+        self.failed_path = DEFAULT_FAILED_IMG
+        self.failed_template: Optional[np.ndarray] = (
+            ScreenMatcher.load_template_gray(self.failed_path)
+            if self.failed_path.is_file() else None
+        )
+
         self.skip_template: Optional[np.ndarray] = None
         if self.skip_path.is_file():
             self.skip_template = ScreenMatcher.load_template_gray(self.skip_path)
+
+        self.heal_path = DEFAULT_HEAL_IMG
+        self.heal_template: Optional[np.ndarray] = (
+            ScreenMatcher.load_template_gray(self.heal_path)
+            if self.heal_path.is_file() else None
+        )
 
         # Loop record keeping
         self.loop_count = 0
@@ -358,11 +447,19 @@ class InputPlayer:
         self.sequences: List[SequenceEntry] = []
         self._load_sequences(target_path, all_sequences, trigger_override)
 
-        # HUD overlay — only shown during recording takeover
+        # Persistent status overlay; takeover controls are shown while recording.
         self.overlay = ScreenOverlay()
         self._button_watcher_stop = threading.Event()
         self._button_watcher: Optional[threading.Thread] = None
+        self._skip_watcher: Optional[threading.Thread] = None
         self._retry_detected = threading.Event()
+        self._skip_detected = threading.Event()
+        self._skip_click_inflight = threading.Event()
+        self._retry_visible = False
+        self._skip_visible = False
+        self._mission_result_visible: Optional[str] = None
+        self._loop_mission_result: Optional[str] = None
+        self._mission_result_tracking = False
 
     def _resolve_json_path(self, p_in: Any) -> Path:
         p = Path(p_in)
@@ -467,6 +564,51 @@ class InputPlayer:
         self.esc_listener.daemon = True
         self.esc_listener.start()
 
+    def _stop_image_visible(self, template: Optional[np.ndarray]) -> bool:
+        target = template if template is not None else self.retry_template
+        if target is None:
+            return False
+        screen = self.matcher.grab_gray()
+        matched, _score, _location = self.matcher.match(
+            target, screen_gray=screen, threshold=self.threshold
+        )
+        return matched
+
+    def _capture_mission_result(self, screen_gray: np.ndarray, force: bool = False) -> None:
+        """Classify the result banner; on Retry, choose the best banner before clicking."""
+        if not self._mission_result_tracking:
+            return
+        candidates = []
+        for result, template in (
+            ("COMPLETED", self.completed_template),
+            ("FAILED", self.failed_template),
+        ):
+            if template is None:
+                continue
+            _matched, score, _ = self.matcher.match(
+                template, screen_gray=screen_gray, threshold=0.0
+            )
+            candidates.append((score, result))
+        if not candidates:
+            return
+        score, result = max(candidates, key=lambda candidate: candidate[0])
+        if not force and score < self.threshold:
+            return
+
+        self._loop_mission_result = result
+        if result != self._mission_result_visible:
+            self._mission_result_visible = result
+            message = f"MISSION {result} detected ({score:.3f})"
+            print(f"\n[RESULT] {message}.")
+            self.overlay.log_event(message)
+
+    def _mark_button_detected(self, label: str) -> None:
+        label = label.upper()
+        if label == "RETRY":
+            self._retry_detected.set()
+        elif label == "SKIP":
+            self._skip_detected.set()
+
     def release_all_inputs(self) -> None:
         """Cleanly releases any currently held keys or mouse buttons."""
         for key in list(self.held_keys):
@@ -537,43 +679,188 @@ class InputPlayer:
             return
         self._button_watcher_stop.clear()
 
-        def watch() -> None:
-            next_skip = next_retry = 0.0
-            last_skip_log = last_retry_log = 0.0
+        def watch_skip() -> None:
+            next_click = 0.0
+            last_log = 0.0
             last_error = None
             while not self._button_watcher_stop.is_set() and not self.abort_requested:
                 try:
-                    now = time.perf_counter()
                     screen_gray = self.matcher.grab_gray()
-                    if self.skip_template is not None and now >= next_skip:
+                    now = time.perf_counter()
+                    if self.skip_template is not None:
+                        sx, sy = self.skip_coords
+                        sh, sw = screen_gray.shape[:2]
+                        region = (
+                            max(0, sx - 300), max(0, sy - 170),
+                            min(sw, sx + 120), min(sh, sy + 90),
+                        )
                         matched, score, _ = self.matcher.match(
-                            self.skip_template, screen_gray=screen_gray, threshold=self.threshold
+                            self.skip_template, screen_gray=screen_gray,
+                            threshold=self.threshold, search_region=region,
                         )
                         if matched:
-                            if now - last_skip_log >= 1.0:
+                            if not self._skip_visible:
+                                self.overlay.log_event("SKIP DETECTED")
+                                self._mark_button_detected("SKIP")
+                            self._skip_visible = True
+                            if now - last_log >= 1.0:
                                 print(f"\n[AUTO] SKIP detected ({score:.3f}); clicking fixed coordinates {self.skip_coords} every 100 ms while visible.")
-                                last_skip_log = now
-                            self.click_screen(*self.skip_coords, label="SKIP")
-                            next_skip = now + 0.1
+                                last_log = now
+                            if now >= next_click and not self._skip_click_inflight.is_set():
+                                self._skip_click_inflight.set()
+                                next_click = now + 0.1
+
+                                def click_skip_async() -> None:
+                                    try:
+                                        self.click_screen(*self.skip_coords, label="SKIP")
+                                    finally:
+                                        self._skip_click_inflight.clear()
+
+                                threading.Thread(
+                                    target=click_skip_async, daemon=True,
+                                    name="SkipClick",
+                                ).start()
+                        else:
+                            self._skip_visible = False
+                    last_error = None
+                except Exception as exc:
+                    message = f"{type(exc).__name__}: {exc}"
+                    if message != last_error:
+                        print(f"\n[!] Skip watcher error: {message}")
+                        last_error = message
+                self._button_watcher_stop.wait(0.001)
+
+        if self.skip_template is not None:
+            self._skip_watcher = threading.Thread(
+                target=watch_skip, daemon=True, name="SkipDetectionWatcher"
+            )
+            self._skip_watcher.start()
+
+        def watch() -> None:
+            next_retry = 0.0
+            next_result_scan = 0.0
+            last_retry_log = 0.0
+            heal_visible = False
+            heal_retry_pending = False
+            retry_visible_since = None
+            retry_click_y = self.retry_coords[1]
+            retry_adjustment_logged = False
+            last_error = None
+            while not self._button_watcher_stop.is_set() and not self.abort_requested:
+                try:
+                    screen_gray = self.matcher.grab_gray()
+                    now = time.perf_counter()
+
+                    if now >= next_result_scan:
+                        next_result_scan = now + 0.25
+                        self._capture_mission_result(screen_gray)
+                    if self.heal_template is not None:
+                        heal_matched, heal_score, _ = self.matcher.match(
+                            self.heal_template,
+                            screen_gray=screen_gray,
+                            threshold=self.threshold,
+                        )
+                        retry_from_heal = heal_retry_pending and heal_matched
+                        if heal_matched and not heal_retry_pending:
+                            if not heal_visible:
+                                self.overlay.log_event(f"HEAL DETECTED ({heal_score:.3f})")
+                                print(f"\n[AUTO] HEAL detected ({heal_score:.3f}); applying heal actions, then repeating the final click every 200 ms until Retry is detected.")
+                            heal_visible = True
+                            for x, y in ((668, 890), (1193, 280)):
+                                for click_index in range(2):
+                                    if self.abort_requested or self._button_watcher_stop.is_set():
+                                        break
+                                    self.click_screen(x, y, label="HEAL")
+                                    if click_index == 0:
+                                        self._button_watcher_stop.wait(0.5)
+                                if self.abort_requested or self._button_watcher_stop.is_set():
+                                    break
+                            if self.abort_requested or self._button_watcher_stop.is_set():
+                                break
+
+                            retry_from_heal = False
+                            next_final_click = time.perf_counter()
+                            while (not self.abort_requested
+                                   and not self._button_watcher_stop.is_set()
+                                   and not self._retry_detected.is_set()):
+                                screen_gray = self.matcher.grab_gray()
+                                now = time.perf_counter()
+                                if self.retry_template is not None:
+                                    retry_from_heal, _retry_score, _ = self.matcher.match(
+                                        self.retry_template,
+                                        screen_gray=screen_gray,
+                                        threshold=self.threshold,
+                                    )
+                                if retry_from_heal:
+                                    self._capture_mission_result(screen_gray, force=True)
+                                    heal_retry_pending = True
+                                    next_retry = 0.0
+                                    break
+
+                                if now >= next_final_click:
+                                    self.click_screen(1863, 73, label="HEAL")
+                                    next_final_click += 0.2
+                                    # Avoid a burst of clicks if one click took
+                                    # longer than the requested repeat period.
+                                    if next_final_click <= time.perf_counter():
+                                        next_final_click = time.perf_counter() + 0.2
+                                else:
+                                    self._button_watcher_stop.wait(
+                                        min(0.01, next_final_click - time.perf_counter())
+                                    )
+                            if self.abort_requested or self._button_watcher_stop.is_set():
+                                break
+                            if self._retry_detected.is_set():
+                                retry_from_heal = True
+                                heal_retry_pending = True
+                                next_retry = 0.0
+                        elif not heal_matched:
+                            heal_visible = False
+                            heal_retry_pending = False
+                    else:
+                        retry_from_heal = False
                     if self.retry_template is not None and now >= next_retry:
                         matched, score, _ = self.matcher.match(
                             self.retry_template, screen_gray=screen_gray, threshold=self.threshold
                         )
                         if matched:
+                            # Classify the mission banner from this same game-over
+                            # frame before signaling Retry or issuing its click.
+                            self._capture_mission_result(screen_gray, force=True)
+                            if not self._retry_visible:
+                                self.overlay.log_event("RETRY DETECTED")
+                                self._mark_button_detected("RETRY")
+                            self._retry_visible = True
+                            if retry_visible_since is None:
+                                retry_visible_since = time.perf_counter()
+                                retry_click_y = self.retry_coords[1]
+                                retry_adjustment_logged = False
                             if now - last_retry_log >= 1.0:
-                                print(f"\n[AUTO] RETRY detected ({score:.3f}); clicking fixed coordinates {self.retry_coords} every 100 ms while visible.")
+                                print(f"\n[AUTO] RETRY detected ({score:.3f}); clicking from {self.retry_coords} every 100 ms, then moving upward 1 pixel per click after 5 seconds.")
                                 last_retry_log = now
-                            clicked = self.click_screen(*self.retry_coords, label="RETRY")
-                            if clicked:
-                                self._retry_detected.set()
-                            next_retry = now + 0.1
+                            if time.perf_counter() - retry_visible_since >= 5.0:
+                                retry_click_y = max(0, retry_click_y - 1)
+                                if not retry_adjustment_logged:
+                                    print("[AUTO] RETRY is still visible after 5 seconds; moving each retry click upward by 1 pixel.")
+                                    retry_adjustment_logged = True
+                            self.click_screen(
+                                self.retry_coords[0], retry_click_y, label="RETRY"
+                            )
+                            next_retry = time.perf_counter() + 0.1
+                        else:
+                            self._retry_visible = False
+                            retry_visible_since = None
+                            retry_click_y = self.retry_coords[1]
+                            retry_adjustment_logged = False
                     last_error = None
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"
                     if message != last_error:
                         print(f"\n[!] Button watcher error: {message}")
                         last_error = message
-                self._button_watcher_stop.wait(0.005)
+                # Skip has its own high-rate scanner; retry/heal and mission
+                # result handling do not need to capture at the same rate.
+                self._button_watcher_stop.wait(0.01)
 
         self._button_watcher = threading.Thread(target=watch, daemon=True, name="SkipRetryWatcher")
         self._button_watcher.start()
@@ -582,7 +869,10 @@ class InputPlayer:
         self._button_watcher_stop.set()
         if self._button_watcher and self._button_watcher is not threading.current_thread():
             self._button_watcher.join(timeout=1.0)
+        if self._skip_watcher and self._skip_watcher is not threading.current_thread():
+            self._skip_watcher.join(timeout=1.0)
         self._button_watcher = None
+        self._skip_watcher = None
 
     def _wait_for_retry_reset(self) -> bool:
         """Wait for the always-on watcher to click Retry and signal cycle reset."""
@@ -590,6 +880,8 @@ class InputPlayer:
         while not self.abort_requested:
             if self._retry_detected.wait(timeout=0.1):
                 self._retry_detected.clear()
+                self._skip_detected.clear()
+                self._skip_visible = False
                 print("[+] Retry handled. Resetting cycle to Phase 1; Skip remains auto-clicked independently.")
                 return True
         return False
@@ -599,8 +891,45 @@ class InputPlayer:
         if not self._retry_detected.is_set():
             return False
         self._retry_detected.clear()
+        self._skip_detected.clear()
+        self._skip_visible = False
         print("\n[+] Retry handled. Discarding the current phase position and resetting to Phase 1.")
         return True
+
+    def _record_loop_result(
+        self,
+        sequence: str,
+        play_duration: float,
+        session_started: float,
+        phase_durations: Optional[Tuple[float, float, str, str]] = None,
+    ) -> None:
+        """Record and print one finished game attempt with its detected outcome."""
+        self.loop_count += 1
+        now_str = datetime.now().strftime("%H:%M:%S")
+        total_elapsed = time.perf_counter() - session_started
+        result = self._loop_mission_result or "UNKNOWN"
+        self.loop_history.append({
+            "loop": self.loop_count,
+            "sequence": sequence,
+            "mission_result": result,
+            "play_duration_sec": round(play_duration, 2),
+            "completed_at": now_str,
+        })
+
+        print("\n" + "=" * 60)
+        print(f"       LOOP #{self.loop_count} — MISSION {result}")
+        print("=" * 60)
+        print(f"  Mission Result   : {result}")
+        if phase_durations is not None:
+            phase1_time, phase2_time, seq1_name, seq2_name = phase_durations
+            print(f"  Phase 1 Time     : {phase1_time:.2f}s ({seq1_name})")
+            print(f"  Phase 2 Time     : {phase2_time:.2f}s ({seq2_name})")
+        else:
+            print(f"  Sequence Played  : {sequence}")
+        print(f"  Total Play Time  : {play_duration:.2f}s")
+        print(f"  Total Loops Done : {self.loop_count}")
+        print(f"  Total Run Time   : {total_elapsed / 60:.1f} minutes")
+        print("=" * 60)
 
     def scan_for_gameplay_trigger(self, screen_gray: np.ndarray) -> Optional[Tuple[SequenceEntry, float, Tuple[int, int]]]:
         """Check screen against all loaded sequence trigger templates."""
@@ -635,44 +964,102 @@ class InputPlayer:
         Stops recording when stop_template (e.g. retry.png or skip.png) is detected.
         """
         total_events = len(seq.events)
+        recording_allowed = seq.phase_hint != 2
+        takeover_during_playback = self.allow_takeover and seq.phase_hint != 2
+        stop_label = stop_label.upper()
+        if stop_label == "SKIP":
+            macro_stop_event = self._skip_detected
+        elif stop_label == "RETRY":
+            macro_stop_event = self._retry_detected
+        else:
+            macro_stop_event = None
+
+        def macro_stop_requested() -> bool:
+            if macro_stop_event is not None:
+                return macro_stop_event.is_set()
+            return self._retry_detected.is_set() or self._skip_detected.is_set()
+
+        macro_duration = seq.duration_seconds
+        if not seq.native_recording and self.speed > 0:
+            macro_duration /= self.speed
+        # Discard a stale Skip edge after the prior phase; if the button is
+        # still on screen, retain it so this macro cannot start through it.
+        if not self._stop_image_visible(self.skip_template):
+            self._skip_detected.clear()
         if seq.native_recording:
             if self.speed != 1.0:
                 print("[!] libinput replay preserves recorded timing; --speed is ignored for native .yml recordings.")
             if self.dry_run:
                 print(f"\n[DRY RUN] Would replay native libinput recording '{seq.json_path}' ({total_events} frames).")
+                self.overlay.set_status("DRY RUN")
                 return 0.0
-            print(f"\n[+] Replaying '{seq.name}' ({total_events} native input frames via libinput)...")
+            print(f"\n[+] Replaying '{seq.name}' ({total_events} native input frames via faithful uinput playback)...")
             capture_path = RECORDINGS_DIR / f".{seq.name}.takeover-{os.getpid()}.partial.yml"
             capture_proc = None
             capture_started = 0.0
+            probe_processes = []
             try:
-                # Event node numbers can change after reconnect/reboot.
-                devices = choose_devices()
-                print("[+] Physical keyboard and mouse monitoring is armed during replay; the macro is saved only if you take control.")
+                # Refresh auth while this process still owns the terminal;
+                # replay itself uses pipes for its startup handshake.
+                sudo_warmup()
                 capture_path.unlink(missing_ok=True)
-                capture_proc = start_libinput_recording(capture_path, devices)
-                capture_started = getattr(capture_proc, "_aotr_started_at", time.perf_counter())
-                process = start_libinput_replay(seq.json_path)
+                devices = []
+                if takeover_during_playback:
+                    # Resolve by recorded device name, not a possibly stale eventN.
+                    device_info = resolve_recording_devices(
+                        seq.json_path, seq.metadata.get("input_devices")
+                    )
+                    devices = [path for path, _name, _role in device_info]
+                    print("[+] Physical keyboard and mouse monitoring is armed during replay; the macro is saved only if you take control.")
+                    capture_proc = start_libinput_recording(capture_path, devices)
+                    capture_started = getattr(capture_proc, "_aotr_started_at", time.perf_counter())
+                    # Only standalone macros can be interrupted by physical input.
+                    for index, (path, _name, role) in enumerate(device_info):
+                        if not ("keyboard" in role or "mouse" in role or "pointer" in role):
+                            continue
+                        probe_path = RECORDINGS_DIR / f".{seq.name}.probe-{os.getpid()}-{index}.yml"
+                        probe_path.unlink(missing_ok=True)
+                        probe_proc = start_libinput_recording(probe_path, [path])
+                        probe_processes.append((probe_proc, probe_path, role))
+                elif not recording_allowed:
+                    print("[+] Gameplay 2 is locked: takeover recording and macro updates are disabled.")
+                else:
+                    print("[+] Gameplay 1 is locked during playback; recording can start only after the macro ends.")
+                process, playback_started = start_replay_at_user_boundary(seq.json_path)
+                self.overlay.set_playing(seq.name, macro_duration)
             except (OSError, LibinputUnavailableError) as exc:
                 if capture_proc:
                     stop_libinput_recording(capture_proc)
+                for probe_proc, probe_path, _role in probe_processes:
+                    stop_libinput_recording(probe_proc)
+                    probe_path.unlink(missing_ok=True)
                 capture_path.unlink(missing_ok=True)
                 self.abort_requested = True
-                print(f"[!] Could not arm takeover recording or start libinput replay: {exc}")
+                print(f"[!] Could not arm takeover recording or start native input replay: {exc}")
                 return 0.0
-            playback_started = time.perf_counter()
+            except KeyboardInterrupt:
+                if capture_proc:
+                    stop_libinput_recording(capture_proc)
+                for probe_proc, probe_path, _role in probe_processes:
+                    stop_libinput_recording(probe_proc)
+                    probe_path.unlink(missing_ok=True)
+                capture_path.unlink(missing_ok=True)
+                raise
             takeover_detected = False
             takeover_detected_at = 0.0
             try:
                 while process.poll() is None:
-                    if self.abort_requested or self._retry_detected.is_set():
+                    if self.abort_requested or macro_stop_requested():
                         break
-                    if count_event_frames(capture_path) > 0:
+                    if any(
+                        has_takeover_input(probe_path, role)
+                        for _probe_proc, probe_path, role in probe_processes
+                    ):
                         takeover_detected = True
                         takeover_detected_at = time.perf_counter()
                         break
-                    time.sleep(0.03)
-                if self.abort_requested or self._retry_detected.is_set():
+                    time.sleep(0.005)
+                if self.abort_requested or macro_stop_requested():
                     stop_libinput_replay(process)
                 elif takeover_detected:
                     print("\n[!] Physical input detected. Taking control and recording your input...")
@@ -683,6 +1070,9 @@ class InputPlayer:
                 if process.poll() is None:
                     stop_libinput_replay(process)
                 stop_libinput_recording(capture_proc)
+                for probe_proc, probe_path, _role in probe_processes:
+                    stop_libinput_recording(probe_proc)
+                    probe_path.unlink(missing_ok=True)
                 capture_path.unlink(missing_ok=True)
                 raise
             finally:
@@ -690,32 +1080,66 @@ class InputPlayer:
                     stop_libinput_replay(process)
                 self.release_all_inputs()
 
+            for probe_proc, probe_path, _role in probe_processes:
+                stop_libinput_recording(probe_proc)
+                probe_path.unlink(missing_ok=True)
+
             elapsed = time.perf_counter() - playback_started
-            if takeover_detected and not self.abort_requested and not self._retry_detected.is_set():
+            macro_finished = process.returncode == 0
+            should_record_after_playback = (
+                recording_allowed and macro_finished
+                and not self._stop_image_visible(stop_template)
+            )
+            stop_detected = macro_stop_requested()
+            should_finalize_takeover = recording_allowed and (
+                takeover_detected or (should_record_after_playback and not stop_detected)
+            )
+            if (should_record_after_playback and not stop_detected
+                    and seq.phase_hint == 1 and capture_proc is None):
+                try:
+                    device_info = resolve_recording_devices(
+                        seq.json_path, seq.metadata.get("input_devices")
+                    )
+                    devices = [path for path, _name, _role in device_info]
+                    capture_proc = start_libinput_recording(capture_path, devices)
+                    capture_started = getattr(capture_proc, "_aotr_started_at", time.perf_counter())
+                except (OSError, LibinputUnavailableError) as exc:
+                    print(f"[!] Could not start Phase 1 post-playback recording: {exc}")
+                    should_finalize_takeover = False
+            if should_finalize_takeover and not self.abort_requested:
+                handoff_seconds = (
+                    takeover_detected_at - playback_started
+                    if takeover_detected else macro_duration
+                )
                 elapsed = self._handle_native_takeover(
                     seq, capture_path, capture_proc, devices,
-                    takeover_seconds=takeover_detected_at - playback_started,
+                    takeover_seconds=handoff_seconds,
                     suffix_origin_seconds=playback_started - capture_started,
                     stop_template=stop_template, stop_label=stop_label,
+                    idle_key_repeat=(not takeover_detected and seq.phase_hint == 1),
                 )
                 capture_proc = None
+            elif self.dry_run:
+                self.overlay.set_status("DRY RUN")
             if capture_proc:
                 stop_libinput_recording(capture_proc)
             capture_path.unlink(missing_ok=True)
             print(f"[+] Replay of '{seq.name}' finished in {elapsed:.2f}s.")
+            self.overlay.set_status("WAITING")
             return elapsed
 
         mode_desc = "Relative (3D motion)" if self.mouse_mode == "relative" else "Absolute"
         print(f"\n[+] Replaying '{seq.name}' ({total_events} events, mouse: {mode_desc}, speed: {self.speed:.2f}x)...")
 
         playback_start = time.perf_counter()
+        self.overlay.set_playing(seq.name, macro_duration)
         prev_event_time = 0.0
         self._accum_dx = 0.0
         self._accum_dy = 0.0
         self._last_legacy_x = None
         self._last_legacy_y = None
 
-        # Takeover detection: listen for real (non-XTest) user input
+        # Phase 1 cannot be interrupted mid-macro; Phase 2 is entirely locked.
         self._takeover_triggered = False
         self._takeover_events_prefix: List[Dict[str, Any]] = []
         self._takeover_initial_event: Optional[Dict[str, Any]] = None
@@ -732,21 +1156,22 @@ class InputPlayer:
                     # real movement/click is lost while listeners are switched.
                     self._takeover_initial_event = event
 
-        _takeover_listener = RawMouseListener(
-            on_move=lambda dx, dy: _on_real_input({"type": "mouse_move", "dx": round(dx, 2), "dy": round(dy, 2)}),
-            on_click=lambda btn, pressed: _on_real_input({"type": "mouse_click", "button": btn, "pressed": pressed}),
-            on_scroll=lambda dx, dy: _on_real_input({"type": "mouse_scroll", "dx": int(dx), "dy": int(dy)}),
-            exclude_slave_ids=self.playback_source_ids,
-        )
-        _takeover_listener.start()
-        _takeover_started = True
+        _takeover_listener = None
+        if takeover_during_playback:
+            _takeover_listener = RawMouseListener(
+                on_move=lambda dx, dy: _on_real_input({"type": "mouse_move", "dx": round(dx, 2), "dy": round(dy, 2)}),
+                on_click=lambda btn, pressed: _on_real_input({"type": "mouse_click", "button": btn, "pressed": pressed}),
+                on_scroll=lambda dx, dy: _on_real_input({"type": "mouse_scroll", "dx": int(dx), "dy": int(dy)}),
+                exclude_slave_ids=self.playback_source_ids,
+            )
+            _takeover_listener.start()
 
         for idx, ev in enumerate(seq.events):
             if self.abort_requested:
                 print("[!] Playback aborted by user.")
                 break
-            if self._retry_detected.is_set():
-                print("\n[!] Retry detected during playback; stopping this macro and resetting its phase.")
+            if macro_stop_requested():
+                print(f"\n[!] {stop_label} detected during playback; stopping this macro.")
                 break
 
             # Check if user has taken over
@@ -773,7 +1198,7 @@ class InputPlayer:
                 deadline = time.perf_counter() + delay
                 while True:
                     with _takeover_lock:
-                        if self._takeover_triggered or self._retry_detected.is_set():
+                        if self._takeover_triggered or macro_stop_requested():
                             break
                     remaining = deadline - time.perf_counter()
                     if remaining <= 0:
@@ -792,8 +1217,8 @@ class InputPlayer:
                         )
                         print(f"\n[!] Real input detected at event {idx}/{total_events}. Switching to record mode...")
                         break
-                if self._retry_detected.is_set():
-                    print("\n[!] Retry detected during playback; stopping this macro and resetting its phase.")
+                if macro_stop_requested():
+                    print(f"\n[!] {stop_label} detected during playback; stopping this macro.")
                     break
             prev_event_time = ev_time
 
@@ -861,18 +1286,42 @@ class InputPlayer:
 
         elapsed = time.perf_counter() - playback_start
         self.release_all_inputs()
-        _takeover_listener.stop()
+        if _takeover_listener is not None:
+            _takeover_listener.stop()
         print(f"[+] Replay of '{seq.name}' finished in {elapsed:.2f}s.")
 
         # If user took over mid-replay, handle recording
-        if self._takeover_triggered and not self._retry_detected.is_set():
+        if takeover_during_playback and self._takeover_triggered and not self.dry_run:
             elapsed = self._handle_takeover_recording(
                 seq, self._takeover_events_prefix, elapsed,
                 sequence_time_offset=self._takeover_sequence_time,
                 initial_event=self._takeover_initial_event,
                 stop_template=stop_template, stop_label=stop_label
             )
+        elif (
+            not self.abort_requested
+            and recording_allowed
+            and not self.dry_run
+            and not self._retry_detected.is_set()
+            and not self._skip_detected.is_set()
+            and not self._stop_image_visible(stop_template)
+        ):
+            # A naturally completed macro now transitions into a live capture
+            # until its phase's Skip/Retry image appears. This lets the user
+            # continue the macro when the recorded portion ends early.
+            print("\n[!] Macro ended without a stop image. Starting live recording until the phase stop image appears...")
+            elapsed = self._handle_takeover_recording(
+                seq, list(seq.events), elapsed,
+                # Use the recorded endpoint, not process wall time. Wall time
+                # includes scheduler and shutdown overhead, which would be
+                # copied into the next saved tail and could accumulate.
+                sequence_time_offset=seq.duration_seconds,
+                initial_event=None,
+                stop_template=stop_template, stop_label=stop_label,
+                idle_key_repeat=(seq.phase_hint == 1),
+            )
 
+        self.overlay.set_status("WAITING")
         return elapsed
 
     def _handle_native_takeover(
@@ -885,9 +1334,19 @@ class InputPlayer:
         suffix_origin_seconds: float,
         stop_template: Optional[np.ndarray],
         stop_label: str,
+        idle_key_repeat: bool = False,
     ) -> float:
         """Continue the already-running physical-device capture through Skip/Retry."""
+        if seq.phase_hint == 2:
+            stop_libinput_recording(capture_proc)
+            self.overlay.set_recording(False)
+            print("[!] Gameplay 2 is locked; discarded takeover capture without changing its macro.")
+            return takeover_seconds
         label = stop_label.upper()
+        if self._retry_detected.is_set():
+            label = "RETRY"
+        elif self._skip_detected.is_set():
+            label = "SKIP"
         print(f"\n[!] >>> TAKEOVER: Recording your input. Stops when [{label}] is detected. <<")
         self.overlay.start()
         self.overlay.set_recording(True)
@@ -898,7 +1357,11 @@ class InputPlayer:
             label = "RETRY"
         print(f"[+] Watching for [{label}] to stop takeover recording...")
 
-        while not self.abort_requested and not self._retry_detected.is_set():
+        activity_monitor = LibinputActivityMonitor(capture_path) if idle_key_repeat else None
+        next_idle_key = time.perf_counter() + 5.0
+        idle_key = KeyCode.from_char("2") if idle_key_repeat else None
+        while (not self.abort_requested and not self._retry_detected.is_set()
+               and not self._skip_detected.is_set()):
             if target_template is not None:
                 screen = self.matcher.grab_gray()
                 matched, score, _ = self.matcher.match(
@@ -906,11 +1369,34 @@ class InputPlayer:
                 )
                 if matched:
                     print(f"[!] >>> {label} DETECTED (score={score:.3f}). Stopping takeover recording. <<<")
+                    self._mark_button_detected(label)
                     break
+            if idle_key is not None:
+                if activity_monitor is not None and activity_monitor.has_meaningful_input():
+                    next_idle_key = time.perf_counter() + 5.0
+                elif time.perf_counter() >= next_idle_key:
+                    key_to_press = idle_key
+                    try:
+                        self.kb_controller.press(key_to_press)
+                        self.held_keys.add(key_to_press)
+                        time.sleep(0.04)
+                    except Exception as exc:
+                        print(f"[!] Could not send automatic [2] key press: {exc}")
+                        idle_key = None
+                    finally:
+                        try:
+                            self.kb_controller.release(key_to_press)
+                        except Exception:
+                            pass
+                        self.held_keys.discard(key_to_press)
+                    next_idle_key = time.perf_counter() + 0.5
             time.sleep(0.016)
 
         stop_libinput_recording(capture_proc)
         self.overlay.set_recording(False)
+        if self.abort_requested:
+            print("[!] Emergency stop during takeover; keeping the existing macro unchanged.")
+            return takeover_seconds
         suffix_frames = count_event_frames(capture_path)
         if suffix_frames < 1:
             print(f"[!] Takeover captured only {suffix_frames} event frames; keeping the existing macro.")
@@ -919,14 +1405,15 @@ class InputPlayer:
         temp_path = seq.json_path.with_name(f".{seq.name}.merged.partial.yml")
         backup_path = seq.json_path.with_suffix(".before-takeover.yml")
         try:
-            merged_frames = merge_recording_suffix(
+            merged_frames, appended_frames = merge_recording_suffix(
                 seq.json_path, capture_path, temp_path,
                 takeover_seconds=takeover_seconds,
                 suffix_origin_seconds=suffix_origin_seconds,
+                collapse_leading_idle=idle_key_repeat,
             )
-            if merged_frames < 1:
+            if appended_frames < 1:
                 temp_path.unlink(missing_ok=True)
-                print("[!] Merged recording was too short; keeping the existing macro.")
+                print("[!] No captured input landed at or after the takeover point; keeping the existing macro.")
                 return takeover_seconds
             if not backup_path.exists():
                 import shutil as _shutil
@@ -934,9 +1421,7 @@ class InputPlayer:
             temp_path.replace(seq.json_path)
             seq.events = [None] * merged_frames
             metadata = dict(seq.metadata)
-            metadata["duration_seconds"] = round(
-                takeover_seconds + (time.perf_counter() - takeover_recording_started), 4
-            )
+            metadata["duration_seconds"] = round(recording_duration_seconds(seq.json_path), 4)
             metadata.update({
                 "created_at": datetime.now().isoformat(),
                 "event_frames": merged_frames,
@@ -949,6 +1434,7 @@ class InputPlayer:
             meta_temp.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
             meta_temp.replace(meta_path)
             seq.metadata = metadata
+            seq.duration_seconds = metadata["duration_seconds"]
             print(f"[+] Saved updated sequence to {seq.json_path} ({merged_frames} event frames)")
             print(f"[+] Original macro backup: {backup_path}")
         except Exception as exc:
@@ -977,8 +1463,15 @@ class InputPlayer:
         Record user input in real time, stop when stop_template (retry or skip) is detected.
         Merges prefix_events + new events and saves back to seq.json_path.
         """
+        if seq.phase_hint == 2:
+            print("[!] Gameplay 2 is locked; takeover recording was refused.")
+            return elapsed_so_far
         target_template = stop_template if stop_template is not None else self.retry_template
         label = stop_label if stop_template is not None else "RETRY"
+        if self._retry_detected.is_set():
+            label = "RETRY"
+        elif self._skip_detected.is_set():
+            label = "SKIP"
         print(f"\n[!] >>> TAKEOVER: Recording your input. Stops when [{label}] is detected. <<<")
 
         self.overlay.start()
@@ -987,6 +1480,10 @@ class InputPlayer:
         new_events: List[Dict[str, Any]] = []
         new_events_lock = threading.Lock()
         rec_start = time.perf_counter()
+        next_idle_key = [rec_start + 5.0]
+        mouse_activity = [0.0, 0.0]
+        post_macro_input_origin = [None]
+        auto_key_injecting = threading.Event()
         # Offset to the moment takeover happened, not merely to the last
         # event. This keeps the replacement timeline continuous through gaps.
         time_offset = max(
@@ -994,10 +1491,40 @@ class InputPlayer:
             sequence_time_offset,
         )
 
-        def _log(ev: Dict[str, Any]):
-            ev["time"] = round(time_offset + (time.perf_counter() - rec_start), 6)
+        def _append_event(ev: Dict[str, Any], timestamp: Optional[float] = None):
+            ev["time"] = round(
+                time_offset + (time.perf_counter() - rec_start)
+                if timestamp is None else timestamp,
+                6,
+            )
             with new_events_lock:
                 new_events.append(ev)
+
+        def _log(ev: Dict[str, Any]):
+            now = time.perf_counter()
+            ev_type = ev.get("type")
+            event_time = time_offset + (now - rec_start)
+            if idle_key_repeat:
+                # The natural post-macro capture may wait briefly for the
+                # Skip screen to appear. Do not turn that detection latency
+                # into dead time at the start of the saved macro tail.
+                if post_macro_input_origin[0] is None:
+                    post_macro_input_origin[0] = now
+                event_time = time_offset + (now - post_macro_input_origin[0])
+            meaningful = ev_type == "key_press"
+            if ev_type == "mouse_click":
+                meaningful = bool(ev.get("pressed"))
+            elif ev_type == "mouse_scroll":
+                meaningful = bool(ev.get("dx", 0) or ev.get("dy", 0))
+            elif ev_type == "mouse_move":
+                mouse_activity[0] += float(ev.get("dx", 0.0))
+                mouse_activity[1] += float(ev.get("dy", 0.0))
+                if abs(mouse_activity[0]) >= 3.0 or abs(mouse_activity[1]) >= 3.0:
+                    meaningful = True
+                    mouse_activity[0] = mouse_activity[1] = 0.0
+            if meaningful:
+                next_idle_key[0] = now + 5.0
+            _append_event(ev, event_time)
 
         if initial_event is not None:
             first_event = dict(initial_event)
@@ -1017,9 +1544,13 @@ class InputPlayer:
         def _on_key_press(key):
             if key == Key.esc:
                 return False
+            if auto_key_injecting.is_set():
+                return
             _log({"type": "key_press", "key": serialize_key(key)})
 
         def _on_key_release(key):
+            if auto_key_injecting.is_set():
+                return
             _log({"type": "key_release", "key": serialize_key(key)})
 
         kb_listener = keyboard.Listener(on_press=_on_key_press, on_release=_on_key_release)
@@ -1027,14 +1558,47 @@ class InputPlayer:
 
         # Poll for stop detection (retry or skip)
         stop_rec = False
+        auto_key = KeyCode.from_char("2") if idle_key_repeat else None
         if target_template is not None:
             print(f"[+] Watching for [{label}] to stop recording...")
-            while not self.abort_requested and not stop_rec:
+            while (not self.abort_requested and not stop_rec
+                   and not self._retry_detected.is_set()
+                   and not self._skip_detected.is_set()):
                 sg = self.matcher.grab_gray()
                 m, score, _ = self.matcher.match(target_template, screen_gray=sg, threshold=self.threshold)
                 if m:
                     print(f"[!] >>> {label} DETECTED (score={score:.3f}). Stopping recording. <<<")
+                    self._mark_button_detected(label)
                     stop_rec = True
+                if (not stop_rec and auto_key is not None
+                        and time.perf_counter() >= next_idle_key[0]):
+                    key_to_press = auto_key
+                    auto_key_injecting.set()
+                    key_time = time_offset + (time.perf_counter() - rec_start)
+                    if post_macro_input_origin[0] is None:
+                        # The automatic fallback is intentionally delayed;
+                        # keep its five-second wait in the replay timeline.
+                        post_macro_input_origin[0] = rec_start
+                    try:
+                        self.kb_controller.press(key_to_press)
+                        self.held_keys.add(key_to_press)
+                        _append_event({"type": "key_press", "key": serialize_key(key_to_press)}, key_time)
+                        time.sleep(0.04)
+                    except Exception as exc:
+                        print(f"[!] Could not send automatic [2] key press: {exc}")
+                        auto_key = None
+                    finally:
+                        try:
+                            self.kb_controller.release(key_to_press)
+                        except Exception:
+                            pass
+                        self.held_keys.discard(key_to_press)
+                        _append_event(
+                            {"type": "key_release", "key": serialize_key(key_to_press)},
+                            time_offset + (time.perf_counter() - rec_start),
+                        )
+                        auto_key_injecting.clear()
+                    next_idle_key[0] = time.perf_counter() + 0.5
                 time.sleep(0.016)
         else:
             print(f"[!] No {label} template found; press [Esc] to stop recording.")
@@ -1045,6 +1609,10 @@ class InputPlayer:
             kb_listener.stop()
 
         self.overlay.set_recording(False)
+
+        if self.abort_requested:
+            print("[!] Emergency stop during takeover; keeping the existing macro unchanged.")
+            return elapsed_so_far + (time.perf_counter() - rec_start)
 
         # Merge and save
         with new_events_lock:
@@ -1059,7 +1627,11 @@ class InputPlayer:
             return elapsed_so_far + rec_duration
 
         new_metadata = dict(seq.metadata)
-        new_metadata["duration_seconds"] = round(time_offset + rec_duration, 4)
+        timeline_end = max(
+            (float(event.get("time", 0.0) or 0.0) for event in merged),
+            default=time_offset,
+        )
+        new_metadata["duration_seconds"] = round(timeline_end, 4)
         new_metadata["event_count"] = len(merged)
         new_metadata["stop_reason"] = f"Takeover recording ({label} detected)"
         new_metadata["created_at"] = datetime.now().isoformat()
@@ -1082,6 +1654,7 @@ class InputPlayer:
 
         # Reload events from disk into seq object so next replay uses new data
         seq.events = merged
+        seq.duration_seconds = timeline_end
 
         print(f"[+] Takeover recording done. {len(new_events)} new events appended.")
         return elapsed_so_far + rec_duration
@@ -1202,9 +1775,13 @@ class InputPlayer:
         return False
 
     def wait_for_specific_gameplay(
-        self, seq: SequenceEntry, threshold: Optional[float] = None
+        self,
+        seq: SequenceEntry,
+        threshold: Optional[float] = None,
+        skip_fallback_timeout: Optional[float] = None,
     ) -> Optional[SequenceEntry]:
         """Watches screen specifically for sequence trigger template(s)."""
+        self.overlay.set_status("WAITING FOR GAMEPLAY")
         match_threshold = self.threshold if threshold is None else threshold
         if not seq.templates_gray:
             print(f"[!] Warning: No trigger images loaded for '{seq.name}'. Proceeding immediately.")
@@ -1212,12 +1789,23 @@ class InputPlayer:
 
         names_str = ", ".join(name for name, _ in seq.templates_gray)
         print(f"\n[+] Waiting for [{seq.name}] trigger(s) ({names_str}, target: >={match_threshold:.2f})...")
+        deadline = (
+            time.monotonic() + skip_fallback_timeout
+            if skip_fallback_timeout is not None and self._skip_detected.is_set()
+            else None
+        )
         peak_score = 0.0
         last_log = time.perf_counter()
 
         while not self.abort_requested:
             if self._retry_detected.is_set():
                 return None
+            if deadline is None and skip_fallback_timeout is not None and self._skip_detected.is_set():
+                deadline = time.monotonic() + skip_fallback_timeout
+            if deadline is not None and time.monotonic() >= deadline:
+                phase = f"Phase {seq.phase_hint}" if seq.phase_hint else seq.name
+                print(f"\n[!] {phase} trigger not detected within {skip_fallback_timeout:.1f}s after Skip; starting its macro automatically.")
+                return seq
             screen_gray = self.matcher.grab_gray()
 
             for name, tmpl in seq.templates_gray:
@@ -1248,6 +1836,7 @@ class InputPlayer:
 
     def wait_for_gameplay_start(self) -> Optional[SequenceEntry]:
         """Watches screen for any gameplay trigger frame, with fallback handling for retry/skip."""
+        self.overlay.set_status("WAITING FOR GAMEPLAY")
         print(f"\n[+] Waiting for GAMEPLAY trigger frame... (Loops completed: {self.loop_count})")
         peak_score = 0.0
         last_log = time.perf_counter()
@@ -1294,6 +1883,10 @@ class InputPlayer:
         """Automated 2-phase continuous loop: Skip1 -> Phase1 -> Skip2 -> Phase2 -> Retry."""
         seq1 = self.sequences[0]
         seq2 = self.sequences[1]
+        # In this mode order defines the phases: Phase 2 is immutable even if
+        # a recording's filename or metadata is ambiguous.
+        seq1.phase_hint = 1
+        seq2.phase_hint = 2
 
         t1_names = ", ".join(name for name, _ in seq1.templates_gray) or seq1.trigger_path.name
         t2_names = ", ".join(name for name, _ in seq2.templates_gray) or seq2.trigger_path.name
@@ -1307,6 +1900,7 @@ class InputPlayer:
         print(f" Mouse Mode       : {self.mouse_mode.upper()} (Optimal for 3D games)")
         print(f" Phase 1 Threshold: {self.threshold:.2f}")
         print(" Phase 2 Threshold: 0.70")
+        print(f" Phase 1 Takeover : {'ENABLED' if self.allow_takeover else 'DISABLED'} (Phase 2 always locked)")
         print(f" Skip Button Img  : {self.skip_path.name}  -> Click at {self.skip_coords}")
         print(f" Retry Button Img : {self.retry_path.name} -> Click at {self.retry_coords}")
         print(f" Loop Automation  : {'ENABLED (Continuous)' if self.loop else 'DISABLED (One-shot)'}")
@@ -1321,6 +1915,8 @@ class InputPlayer:
         try:
             while not self.abort_requested:
                 loop_num = self.loop_count + 1
+                self._loop_mission_result = None
+                self._mission_result_tracking = False
                 print(f"\n" + "=" * 60)
                 print(f"             >>> STARTING LOOP #{loop_num} <<<")
                 print("=" * 60)
@@ -1330,13 +1926,17 @@ class InputPlayer:
                 # the independent watcher and is not a sequencing gate.
                 # ---------------------------------------------------------
                 print(f"\n[PHASE 1] Step 1/2: Waiting for Gameplay 1 Trigger ({t1_names})...")
-                matched_seq = self.wait_for_specific_gameplay(seq1)
+                matched_seq = self.wait_for_specific_gameplay(
+                    seq1, skip_fallback_timeout=1.0
+                )
                 if self.abort_requested:
                     break
                 if self._consume_retry_reset():
                     continue
                 if matched_seq is None:
                     break
+                self._mission_result_tracking = True
+                self._mission_result_visible = None
 
                 # ---------------------------------------------------------
                 # 2. Replay Phase 1 Sequence (Takeover stops on skip.png)
@@ -1346,16 +1946,30 @@ class InputPlayer:
                 if self.abort_requested:
                     break
                 if self._consume_retry_reset():
+                    self._record_loop_result(
+                        f"{seq1.name} + {seq2.name}", duration1,
+                        total_session_start,
+                        (duration1, 0.0, seq1.name, seq2.name),
+                    )
                     continue
 
                 # ---------------------------------------------------------
                 # 1. Wait for Gameplay 2 Trigger Frame
                 # ---------------------------------------------------------
                 print(f"\n[PHASE 2] Step 1/2: Waiting for Gameplay 2 Trigger ({t2_names})...")
-                matched_seq = self.wait_for_specific_gameplay(seq2, threshold=0.70)
+                matched_seq = self.wait_for_specific_gameplay(
+                    seq2,
+                    threshold=0.70,
+                    skip_fallback_timeout=1.0,
+                )
                 if self.abort_requested:
                     break
                 if self._consume_retry_reset():
+                    self._record_loop_result(
+                        f"{seq1.name} + {seq2.name}", duration1,
+                        total_session_start,
+                        (duration1, 0.0, seq1.name, seq2.name),
+                    )
                     continue
                 if matched_seq is None:
                     break
@@ -1367,38 +1981,22 @@ class InputPlayer:
                 duration2 = self.replay_sequence(seq2, stop_template=self.retry_template, stop_label="RETRY")
                 if self.abort_requested:
                     break
-                if self._consume_retry_reset():
-                    continue
 
                 # Retry detection is the explicit cycle boundary. The global
                 # watcher clicks it wherever it appears; after it is handled,
                 # restart the macro state from Phase 1. Skip remains automatic.
-                if not self._wait_for_retry_reset():
+                retry_already_detected = self._consume_retry_reset()
+                if not retry_already_detected and not self._wait_for_retry_reset():
                     break
 
                 # ---------------------------------------------------------
                 # 3. Record Loop Completion & Log Statistics
                 # ---------------------------------------------------------
-                self.loop_count += 1
-                now_str = datetime.now().strftime("%H:%M:%S")
-                total_elapsed = time.perf_counter() - total_session_start
-
-                self.loop_history.append({
-                    "loop": self.loop_count,
-                    "sequence": f"{seq1.name} + {seq2.name}",
-                    "play_duration_sec": round(duration1 + duration2, 2),
-                    "completed_at": now_str,
-                })
-
-                print("\n" + "=" * 60)
-                print(f"       ★ ★ ★  LOOP #{self.loop_count} COMPLETED SUCCESSFULLY!  ★ ★ ★")
-                print("=" * 60)
-                print(f"  Phase 1 Time     : {duration1:.2f}s ({seq1.name})")
-                print(f"  Phase 2 Time     : {duration2:.2f}s ({seq2.name})")
-                print(f"  Total Play Time  : {(duration1 + duration2):.2f}s")
-                print(f"  Total Loops Done : {self.loop_count}")
-                print(f"  Total Run Time   : {total_elapsed / 60:.1f} minutes")
-                print("=" * 60)
+                self._record_loop_result(
+                    f"{seq1.name} + {seq2.name}", duration1 + duration2,
+                    total_session_start,
+                    (duration1, duration2, seq1.name, seq2.name),
+                )
 
                 if not self.loop:
                     print("[+] One-shot mode completed. Exiting.")
@@ -1433,6 +2031,7 @@ class InputPlayer:
 
         try:
             while not self.abort_requested:
+                self._loop_mission_result = None
                 # 1. Wait for Gameplay Trigger Frame
                 matched_seq = self.wait_for_gameplay_start()
                 if self.abort_requested:
@@ -1441,34 +2040,19 @@ class InputPlayer:
                     continue
                 if matched_seq is None:
                     break
+                self._mission_result_tracking = True
+                self._mission_result_visible = None
 
                 # 2. Replay the Gameplay Sequence
                 play_duration = self.replay_sequence(matched_seq)
                 if self.abort_requested:
                     break
-                if self._consume_retry_reset():
-                    continue
+                self._consume_retry_reset()
 
                 # 3. Record Loop Completion & Log Statistics
-                self.loop_count += 1
-                now_str = datetime.now().strftime("%H:%M:%S")
-                total_elapsed = time.perf_counter() - total_session_start
-
-                self.loop_history.append({
-                    "loop": self.loop_count,
-                    "sequence": matched_seq.name,
-                    "play_duration_sec": round(play_duration, 2),
-                    "completed_at": now_str,
-                })
-
-                print("\n" + "=" * 60)
-                print(f"       ★ ★ ★  LOOP #{self.loop_count} COMPLETED SUCCESSFULLY!  ★ ★ ★")
-                print("=" * 60)
-                print(f"  Sequence Played  : {matched_seq.name}")
-                print(f"  Sequence Time    : {play_duration:.2f} seconds")
-                print(f"  Total Loops Done : {self.loop_count}")
-                print(f"  Total Run Time   : {total_elapsed / 60:.1f} minutes")
-                print("=" * 60)
+                self._record_loop_result(
+                    matched_seq.name, play_duration, total_session_start
+                )
 
                 if not self.loop:
                     print("[+] One-shot mode completed. Exiting.")
@@ -1483,6 +2067,8 @@ class InputPlayer:
     def run(self) -> None:
         """Entry point; button handling runs independently of macro phases."""
         try:
+            self.overlay.start()
+            self.overlay.set_status("READY")
             self._start_button_watcher()
             if len(self.sequences) == 2:
                 self.run_two_phase_loop()
@@ -1499,7 +2085,8 @@ class InputPlayer:
             print("=" * 60)
             print(f"  Total Loops Completed : {self.loop_count}")
             for h in self.loop_history:
-                print(f"   - Loop #{h['loop']}: {h['sequence']} ({h['play_duration_sec']}s at {h['completed_at']})")
+                result = h.get("mission_result", "UNKNOWN")
+                print(f"   - Loop #{h['loop']}: {result} — {h['sequence']} ({h['play_duration_sec']}s at {h['completed_at']})")
             print("=" * 60)
 
 
@@ -1539,6 +2126,11 @@ def main():
     parser.add_argument("--mouse-mode", type=str, choices=["relative", "absolute"], default="relative",
                         help="Mouse replay mode: 'relative' (default, 3D raw motion) or 'absolute' (desktop UI)")
     parser.add_argument("--dry-run", action="store_true", help="Simulate trigger matching and timing without sending inputs")
+    parser.add_argument(
+        "--allow-takeover",
+        action="store_true",
+        help="Allow physical input to take over Phase 1 during playback (disabled by default; Phase 2 remains locked).",
+    )
     args = parser.parse_args()
 
     # Determine sequence targets
@@ -1609,6 +2201,7 @@ def main():
         monitor_idx=args.monitor,
         dry_run=args.dry_run,
         mouse_mode=args.mouse_mode,
+        allow_takeover=args.allow_takeover,
     )
     player.run()
 

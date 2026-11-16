@@ -43,6 +43,8 @@ from libinput_backend import (
     LibinputUnavailableError,
     choose_devices,
     count_event_frames,
+    recording_duration_seconds,
+    remove_key_events,
     start_recording as start_libinput_recording,
     stop_recording as stop_libinput_recording,
     sudo_warmup,
@@ -437,6 +439,14 @@ class InputRecorder:
         self.libinput_process = None
         stop_libinput_recording(process)
 
+        # Esc exits the recorder, but libinput records the physical key in
+        # parallel before it receives the stop signal. Keep that control key
+        # out of playback so it cannot abort the player on the next run.
+        if self.stop_reason == "Manual exit key (Esc)":
+            removed = remove_key_events(self.partial_recording_path, key_code=1)
+            if removed:
+                print(f"[+] Removed the recorder's final Esc stop frame ({removed} frame(s)).")
+
         # Update HUD back to Bright Red
         self.overlay.set_recording(False)
 
@@ -445,6 +455,9 @@ class InputRecorder:
             total_duration = time.perf_counter() - self.start_time
 
         frame_count = count_event_frames(self.partial_recording_path)
+        recorded_duration = recording_duration_seconds(self.partial_recording_path)
+        if recorded_duration > 0:
+            total_duration = recorded_duration
         if frame_count < 10:
             print(
                 f"[!] Incomplete capture ({frame_count} event frames); keeping any existing "
@@ -459,7 +472,7 @@ class InputRecorder:
             metadata = {
                 "name": self.name,
                 "created_at": datetime.now().isoformat(),
-                "duration_seconds": round(total_duration, 4),
+                "duration_seconds": round(total_duration, 6),
                 "event_frames": frame_count,
                 "stop_reason": self.stop_reason,
                 "start_image": str(self.start_image_path),

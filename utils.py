@@ -704,6 +704,7 @@ class ScreenMatcher:
     def __init__(self, monitor_idx: int = 1):
         self._use_fc = _FC_AVAILABLE
         self.monitor_idx = monitor_idx
+        self._capture_lock = threading.Lock()
 
         if self._use_fc:
             # Resolve monitor geometry via mss (one-off, only for dimensions)
@@ -719,16 +720,17 @@ class ScreenMatcher:
             self.monitor = mons[monitor_idx] if len(mons) > monitor_idx else mons[0]
 
     def close(self) -> None:
-        if self._use_fc:
-            try:
-                _fc.close_capture()
-            except Exception:
-                pass
-        else:
-            try:
-                self._sct.close()
-            except Exception:
-                pass
+        with self._capture_lock:
+            if self._use_fc:
+                try:
+                    _fc.close_capture()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._sct.close()
+                except Exception:
+                    pass
 
     def grab_frame(self) -> np.ndarray:
         """Grab raw BGRA screen array."""
@@ -740,11 +742,15 @@ class ScreenMatcher:
         return np.frombuffer(raw.raw, dtype=np.uint8).reshape((raw.height, raw.width, 4))
 
     def grab_gray(self) -> np.ndarray:
-        """Grab grayscale frame — uses C SHM path when available."""
-        if self._use_fc:
-            return _fc.grab_gray()
-        bgra = self.grab_frame()
-        return cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+        """Grab an immutable grayscale snapshot, using C SHM when available."""
+        with self._capture_lock:
+            if self._use_fc:
+                # fast_capture reuses one static output buffer; copy it before
+                # releasing the lock so another watcher cannot overwrite a
+                # frame while OpenCV is matching it.
+                return _fc.grab_gray().copy()
+            bgra = self.grab_frame()
+            return cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
 
     def save_screenshot(self, file_path: Union[str, Path]) -> str:
         """Save a colour screenshot to file_path."""
@@ -774,13 +780,15 @@ class ScreenMatcher:
         template_gray: np.ndarray,
         screen_gray: Optional[np.ndarray] = None,
         threshold: float = 0.70,
+        search_region: Optional[Tuple[int, int, int, int]] = None,
     ) -> Tuple[bool, float, Tuple[int, int]]:
         """
         Fast template match against screen.
         For large / full-screen templates (typical for 3D games), uses adaptive
         downscaling (480x270) which executes in < 2ms (150+ FPS) and acts as a
         structural filter immune to micro-pixel camera jitter and lighting flicker.
-        For small cropped templates (icons/HUD), matches at native resolution.
+        Fixed-region button checks crop first and use half-size matching to
+        keep repeated UI detection inexpensive.
         """
         if template_gray is None:
             return False, 0.0, (0, 0)
@@ -790,6 +798,15 @@ class ScreenMatcher:
 
         th, tw = template_gray.shape[:2]
         sh, sw = screen_gray.shape[:2]
+        region_offset = (0, 0)
+        if search_region is not None:
+            x1, y1, x2, y2 = search_region
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(sw, x2), min(sh, y2)
+            if x2 - x1 >= tw and y2 - y1 >= th:
+                screen_gray = screen_gray[y1:y2, x1:x2]
+                sh, sw = screen_gray.shape[:2]
+                region_offset = (x1, y1)
 
         # Case 1: Large or Full-Screen template (typical 3D game scene / frame)
         # Compare both the whole scene and the fixed top HUD. The scene can
@@ -824,17 +841,22 @@ class ScreenMatcher:
             template_gray = cv2.resize(template_gray, (min(tw, sw), min(th, sh)))
 
         # 2x downsampling if screen is high-res (e.g. 1080p) to achieve ~10ms matching
-        if sh >= 720 and sw >= 1280 and th >= 16 and tw >= 16:
+        if ((sh >= 720 and sw >= 1280) or search_region is not None) and th >= 16 and tw >= 16:
             s_half = cv2.resize(screen_gray, (sw // 2, sh // 2), interpolation=cv2.INTER_AREA)
             t_half = cv2.resize(template_gray, (max(8, tw // 2), max(8, th // 2)), interpolation=cv2.INTER_AREA)
             res = cv2.matchTemplate(s_half, t_half, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            return bool(max_val >= threshold), float(max_val), (max_loc[0] * 2, max_loc[1] * 2)
+            return bool(max_val >= threshold), float(max_val), (
+                max_loc[0] * 2 + region_offset[0],
+                max_loc[1] * 2 + region_offset[1],
+            )
 
         res = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
         matched = bool(max_val >= threshold)
-        return matched, float(max_val), max_loc
+        return matched, float(max_val), (
+            max_loc[0] + region_offset[0], max_loc[1] + region_offset[1]
+        )
 
     def compare_multiple_templates(
         self,

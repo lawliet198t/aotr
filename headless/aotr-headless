@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BASE_RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATE_DIR="$BASE_RUNTIME/aotr-headless"
+RUNTIME_DIR="$STATE_DIR/runtime"
+SWAY_PID_FILE="$STATE_DIR/sway.pid"
+WAYVNC_PID_FILE="$STATE_DIR/wayvnc.pid"
+INPUT_PID_FILE="$STATE_DIR/input.pid"
+INPUT_SOCKET="$STATE_DIR/input.sock"
+WAYLAND_FILE="$STATE_DIR/wayland-display"
+SWAYSOCK_FILE="$STATE_DIR/sway-sock"
+SWAY_LOG="$STATE_DIR/sway.log"
+WAYVNC_LOG="$STATE_DIR/wayvnc.log"
+INPUT_LOG="$STATE_DIR/input.log"
+APP_ID="org.vinegarhq.Sober"
+
+die() { printf '[headless] ERROR: %s\n' "$*" >&2; exit 1; }
+note() { printf '[headless] %s\n' "$*"; }
+
+prepare_dirs() {
+    [[ -d "$BASE_RUNTIME" && -O "$BASE_RUNTIME" ]] || \
+        die "Runtime directory missing or not owned by this user: $BASE_RUNTIME"
+    mkdir -p -m 700 "$STATE_DIR" "$RUNTIME_DIR"
+    chmod 700 "$STATE_DIR" "$RUNTIME_DIR"
+}
+
+required_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing '$1'. Install the packages listed in headless/TESTING.md."
+}
+
+find_intel_render_node() {
+    local sys_path vendor node
+    for sys_path in /sys/class/drm/renderD*; do
+        [[ -r "$sys_path/device/vendor" ]] || continue
+        read -r vendor < "$sys_path/device/vendor"
+        [[ "$vendor" == "0x8086" ]] || continue
+        node="/dev/dri/${sys_path##*/}"
+        [[ -c "$node" && -r "$node" && -w "$node" ]] || continue
+        printf '%s\n' "$node"
+        return 0
+    done
+    return 1
+}
+
+pid_is_process() {
+    local pid="$1" expected="$2" actual
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/comm" ]] || return 1
+    read -r actual < "/proc/$pid/comm"
+    [[ "$actual" == "$expected" ]]
+}
+
+read_pid() {
+    local file="$1" value=""
+    [[ -r "$file" ]] && read -r value < "$file" || true
+    printf '%s' "$value"
+}
+
+discover_session() {
+    local sock
+    WAYLAND_DISPLAY=""
+    SWAYSOCK=""
+    for sock in "$RUNTIME_DIR"/wayland-*; do
+        if [[ -S "$sock" ]]; then
+            WAYLAND_DISPLAY="${sock##*/}"
+            break
+        fi
+    done
+    for sock in "$RUNTIME_DIR"/sway-ipc.*.sock; do
+        if [[ -S "$sock" ]]; then
+            SWAYSOCK="$sock"
+            break
+        fi
+    done
+}
+
+load_session() {
+    prepare_dirs
+    discover_session
+    [[ -n "$WAYLAND_DISPLAY" && -n "$SWAYSOCK" ]] || return 1
+    swaymsg -s "$SWAYSOCK" -t get_version >/dev/null 2>&1
+}
+
+get_xdisplay() {
+    local i value
+    # The Sway IPC socket can become ready before its forced XWayland server
+    # finishes starting. Wait for both the display number and Xserver-ready
+    # log entry instead of racing start_input_service/game against it.
+    for ((i = 0; i < 100; i++)); do
+        value="$(sed -nE 's/.*Starting Xwayland on (:[0-9]+)$/\1/p' "$SWAY_LOG" | tail -n 1)"
+        if [[ -n "$value" ]] && grep -Fq 'Xserver is ready' "$SWAY_LOG"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+start_sway() {
+    local render_node pid i
+    required_command sway
+    required_command swaymsg
+    required_command nohup
+
+    if load_session; then
+        note "Headless Sway is already running ($WAYLAND_DISPLAY)."
+        return 0
+    fi
+
+    local old_pid
+    old_pid="$(read_pid "$SWAY_PID_FILE")"
+    if pid_is_process "$old_pid" sway; then
+        die "Sway process $old_pid exists, but its IPC socket is not responding. Check $SWAY_LOG before restarting it."
+    fi
+    stop_input_service
+    rm -f "$INPUT_SOCKET"
+    # The private runtime directory is owned by this launcher. Clear only
+    # stale Wayland/Sway socket paths after confirming its recorded Sway PID
+    # is no longer alive, so a dead session cannot masquerade as a live one.
+    rm -f "$RUNTIME_DIR"/wayland-* "$RUNTIME_DIR"/sway-ipc.*.sock
+
+    render_node="${AOTR_RENDER_NODE:-}"
+    if [[ -z "$render_node" ]]; then
+        render_node="$(find_intel_render_node)" || \
+            die "No accessible Intel render node found. Set AOTR_RENDER_NODE=/dev/dri/renderDXXX after identifying the correct node."
+    fi
+    [[ "$render_node" == /dev/dri/renderD* && -c "$render_node" && -r "$render_node" && -w "$render_node" ]] || \
+        die "Render node is invalid or inaccessible: $render_node"
+
+    note "Starting private Sway session using $render_node (Intel selected by default)."
+    note "Sway 1.9 needs --unsupported-gpu while the proprietary NVIDIA module is loaded."
+    nohup env -u WAYLAND_DISPLAY -u DISPLAY \
+        XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+        WLR_BACKENDS=headless \
+        WLR_LIBINPUT_NO_DEVICES=1 \
+        WLR_HEADLESS_OUTPUTS=1 \
+        WLR_RENDERER=gles2 \
+        WLR_RENDER_DRM_DEVICE="$render_node" \
+        sway --unsupported-gpu -d -c "$SCRIPT_DIR/headless.conf" \
+        </dev/null >"$SWAY_LOG" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$SWAY_PID_FILE"
+
+    for ((i = 0; i < 100; i++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            tail -n 50 "$SWAY_LOG" >&2 || true
+            die "Sway exited during startup. See $SWAY_LOG."
+        fi
+        discover_session
+        if [[ -n "$WAYLAND_DISPLAY" && -n "$SWAYSOCK" ]]; then
+            printf '%s\n' "$WAYLAND_DISPLAY" > "$WAYLAND_FILE"
+            printf '%s\n' "$SWAYSOCK" > "$SWAYSOCK_FILE"
+            break
+        fi
+        sleep 0.1
+    done
+
+    [[ -n "$WAYLAND_DISPLAY" && -n "$SWAYSOCK" ]] || {
+        tail -n 50 "$SWAY_LOG" >&2 || true
+        die "Sway did not create its Wayland and IPC sockets. See $SWAY_LOG."
+    }
+
+    note "Sway started: WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    note "Sway IPC: $SWAYSOCK"
+}
+
+start_wayvnc() {
+    local existing pid
+    required_command wayvnc
+    if [[ -r "$WAYVNC_PID_FILE" ]]; then
+        existing="$(read_pid "$WAYVNC_PID_FILE")"
+        if pid_is_process "$existing" wayvnc; then
+            note "WayVNC is already running on localhost:5900."
+            return 0
+        fi
+    fi
+
+    note "Starting WayVNC on 127.0.0.1:5900 (local connections only)."
+    nohup env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+        wayvnc --max-fps=120 --performance 127.0.0.1 5900 \
+        </dev/null >"$WAYVNC_LOG" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$WAYVNC_PID_FILE"
+    sleep 0.4
+    if ! pid_is_process "$pid" wayvnc; then
+        tail -n 50 "$WAYVNC_LOG" >&2 || true
+        die "WayVNC exited during startup. See $WAYVNC_LOG."
+    fi
+}
+
+attach_input_devices() {
+    # Virtual keyboards/pointers can appear after Sway starts. Explicitly
+    # attach them so Sway advertises keyboard/pointer capabilities to the
+    # focused XWayland game instead of silently listing unattached devices.
+    swaymsg -s "$SWAYSOCK" 'seat seat0 attach *' >/dev/null || \
+        die "Could not attach the private virtual keyboard/mouse to seat0. Check $SWAY_LOG."
+}
+
+restart_wayvnc() {
+    load_session || die "Headless Sway is not running. Start it first."
+    stop_one "$WAYVNC_PID_FILE" wayvnc
+    start_wayvnc
+    note "WayVNC restarted at its configured 120 FPS capture limit; Sway, Sober, and the input service were left running."
+}
+
+start_input_service() {
+    local existing pid i xdisplay binary="$SCRIPT_DIR/build/x11-input"
+    [[ -x "$binary" ]] || die "Replay helper is not built. Run: make -C headless"
+    if [[ -r "$INPUT_PID_FILE" ]]; then
+        existing="$(read_pid "$INPUT_PID_FILE")"
+        if pid_is_process "$existing" x11-input; then
+            if [[ -e "/proc/$existing/exe" && "/proc/$existing/exe" -ef "$binary" ]]; then
+                [[ -S "$INPUT_SOCKET" ]] || die "Persistent input service is running without its socket. Check $INPUT_LOG."
+                note "Private XWayland XTest input service is already running."
+                return 0
+            fi
+            note "Replacing the older private XWayland input service with the current helper."
+            stop_one "$INPUT_PID_FILE" x11-input
+        fi
+        # Replace the earlier Wayland virtual-input process during upgrade.
+        if pid_is_process "$existing" wayland-input; then
+            stop_one "$INPUT_PID_FILE" wayland-input
+        fi
+    fi
+    rm -f "$INPUT_SOCKET"
+    xdisplay="$(get_xdisplay)" || die "Private XWayland did not become ready. Check $SWAY_LOG."
+    note "Starting persistent XTest input service on private XWayland $xdisplay."
+    nohup env XDG_RUNTIME_DIR="$RUNTIME_DIR" DISPLAY="$xdisplay" \
+        XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        "$binary" --server "$INPUT_SOCKET" </dev/null >"$INPUT_LOG" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$INPUT_PID_FILE"
+    for ((i = 0; i < 50; i++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            tail -n 40 "$INPUT_LOG" >&2 || true
+            die "Persistent input service exited during startup. See $INPUT_LOG."
+        fi
+        if [[ -S "$INPUT_SOCKET" ]] && pid_is_process "$pid" x11-input; then
+            note "Private XWayland XTest input service is ready."
+            return 0
+        fi
+        sleep 0.1
+    done
+    tail -n 40 "$INPUT_LOG" >&2 || true
+    die "Persistent input service did not become ready. See $INPUT_LOG."
+}
+
+start_session() {
+    prepare_dirs
+    [[ -x "$SCRIPT_DIR/build/x11-input" ]] || die "Replay helper is not built. Run: make -C headless"
+    start_sway
+    discover_session
+    start_input_service
+    attach_input_devices
+    start_wayvnc
+    note "Headless session ready. Logs: $SWAY_LOG and $WAYVNC_LOG"
+    note "Use '$0 status', '$0 screenshot', '$0 viewer', '$0 game', and '$0 automate'."
+}
+
+stop_one() {
+    local pid_file="$1" expected="$2" pid i
+    pid="$(read_pid "$pid_file")"
+    if ! pid_is_process "$pid" "$expected"; then
+        rm -f "$pid_file"
+        return 0
+    fi
+    note "Stopping $expected (PID $pid)."
+    kill -TERM "$pid" 2>/dev/null || true
+    for ((i = 0; i < 40; i++)); do
+        pid_is_process "$pid" "$expected" || break
+        sleep 0.1
+    done
+    if pid_is_process "$pid" "$expected"; then
+        note "$expected did not exit after SIGTERM; sending SIGKILL to its recorded PID."
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
+stop_input_service() {
+    local pid
+    pid="$(read_pid "$INPUT_PID_FILE")"
+    if pid_is_process "$pid" x11-input; then
+        stop_one "$INPUT_PID_FILE" x11-input
+    elif pid_is_process "$pid" wayland-input; then
+        stop_one "$INPUT_PID_FILE" wayland-input
+    else
+        rm -f "$INPUT_PID_FILE"
+    fi
+}
+
+stop_session() {
+    prepare_dirs
+    stop_one "$WAYVNC_PID_FILE" wayvnc
+    stop_input_service
+    stop_one "$SWAY_PID_FILE" sway
+    rm -f "$INPUT_SOCKET"
+    rm -f "$WAYLAND_FILE" "$SWAYSOCK_FILE"
+    note "Stopped. Logs remain in $STATE_DIR."
+}
+
+show_status() {
+    if ! load_session; then
+        note "Headless Sway is not running."
+        return 1
+    fi
+    note "Wayland display: $WAYLAND_DISPLAY"
+    note "IPC socket: $SWAYSOCK"
+    note "Output status:"
+    swaymsg -s "$SWAYSOCK" -t get_outputs || true
+    note "Renderer details are in $SWAY_LOG (search for 'GL renderer')."
+    local pid
+    pid="$(read_pid "$WAYVNC_PID_FILE")"
+    if pid_is_process "$pid" wayvnc; then
+        note "WayVNC is running at 127.0.0.1:5900."
+    else
+        note "WayVNC is not running. Run '$0 start' to start it."
+    fi
+    pid="$(read_pid "$INPUT_PID_FILE")"
+    if pid_is_process "$pid" x11-input && [[ -S "$INPUT_SOCKET" ]]; then
+        note "Private XWayland XTest input service is running."
+    else
+        note "Private XWayland XTest input service is not running. Run '$0 start' to start it."
+    fi
+}
+
+take_screenshot() {
+    local destination="${1:-$STATE_DIR/preview.png}"
+    required_command grim
+    load_session || die "Headless Sway is not running. Start it first."
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+        grim -o HEADLESS-1 "$destination"
+    note "Saved headless screenshot: $destination"
+}
+
+launch_game() {
+    local backend="${1:-x11}"
+    local running xdisplay
+    required_command flatpak
+    load_session || die "Headless Sway is not running. Start it first."
+    flatpak info "$APP_ID" >/dev/null 2>&1 || die "Flatpak app is not installed: $APP_ID"
+    running="$(flatpak ps --columns=application 2>/dev/null || true)"
+    if printf '%s\n' "$running" | grep -Fxq "$APP_ID"; then
+        die "Sober is already running. Close it on the normal desktop first so this test cannot attach to the wrong session."
+    fi
+    case "$backend" in
+        wayland)
+            note "Launching Sober on native Wayland inside the private Sway session."
+            swaymsg -s "$SWAYSOCK" exec "flatpak run --socket=wayland --nosocket=x11 --nosocket=fallback-x11 $APP_ID"
+            ;;
+        x11)
+            required_command Xwayland
+            xdisplay="$(get_xdisplay)" || die "Private XWayland did not become ready. Check $SWAY_LOG."
+            note "Launching Sober through private XWayland to match the normal X11 desktop input path."
+            swaymsg -s "$SWAYSOCK" exec "DISPLAY=$xdisplay flatpak run --nosocket=wayland --nosocket=fallback-x11 --socket=x11 $APP_ID"
+            ;;
+        *)
+            die "Unknown Sober backend '$backend'. Use 'wayland' or 'x11'."
+            ;;
+    esac
+}
+
+open_viewer() {
+    local mode="${1:-}"
+    local -a viewer_options=()
+    required_command vncviewer
+    case "$mode" in
+        "")
+            viewer_options=(-ViewOnly)
+            note "Opening view-only VNC. This viewer will not send host keyboard or mouse input to the game."
+            ;;
+        --control)
+            note "Opening interactive VNC. Input in the viewer will control the headless game."
+            ;;
+        *) die "Usage: $0 viewer [--control]" ;;
+    esac
+    [[ $# -le 1 ]] || die "Usage: $0 viewer [--control]"
+    note "Close the viewer to disconnect; the headless session remains running."
+    vncviewer "${viewer_options[@]}" 127.0.0.1::5900
+}
+
+pointer_test() {
+    required_command wlrctl
+    load_session || die "Headless Sway is not running. Start it first."
+    note "Sending one tiny relative pointer motion (+5, 0). This can move the game camera slightly if the game is focused."
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+        wlrctl pointer move 5 0
+}
+
+click_at() {
+    required_command python3
+    [[ $# -eq 2 ]] || die "Usage: $0 click X Y"
+    load_session || die "Headless Sway is not running. Start it first."
+    local xdisplay
+    xdisplay="$(get_xdisplay)" || die "Private XWayland did not become ready. Check $SWAY_LOG."
+    DISPLAY="$xdisplay" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" SWAYSOCK="$SWAYSOCK" \
+        python3 "$SCRIPT_DIR/x11_click.py" "$1" "$2"
+}
+
+replay_macro() {
+    required_command python3
+    if [[ " ${*:-} " == *" --dry-run "* ]]; then
+        python3 "$SCRIPT_DIR/replay.py" "$@"
+        return
+    fi
+    load_session || die "Headless Sway is not running. Start it first."
+    # Repair a stale/missing helper instead of relying on the socket file left
+    # by an earlier session. The virtual devices must be connected to this
+    # live Sway instance before the replay client can send frames.
+    start_input_service
+    attach_input_devices
+    note "Replaying through XTest into private XWayland. The recording file will not be modified."
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" AOTR_INPUT_SOCKET="$INPUT_SOCKET" \
+        python3 "$SCRIPT_DIR/replay.py" "$@"
+}
+
+run_automation() {
+    local python="$SCRIPT_DIR/../.venv/bin/python3"
+    local xdisplay
+    load_session || die "Headless Sway is not running. Start it first."
+    # Automation needs both persistent services. Recover either one if a
+    # prior viewer/automation failure left its pid or socket file stale.
+    start_input_service
+    start_wayvnc
+    attach_input_devices
+    xdisplay="$(get_xdisplay)" || die "Private XWayland did not become ready. Check $SWAY_LOG."
+    [[ -x "$python" ]] || die "Project Python environment is missing. Create it with: python3 -m venv .venv"
+    note "Starting headless trigger automation. Ctrl+C stops it and releases macro inputs."
+    env DISPLAY="$xdisplay" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        AOTR_INPUT_SOCKET="$INPUT_SOCKET" AOTR_SWAYSOCK="$SWAYSOCK" \
+        "$python" "$SCRIPT_DIR/automation.py" "$@"
+}
+
+set_refresh_120() {
+    required_command swaymsg
+    load_session || die "Headless Sway is not running. Start it first."
+    swaymsg -s "$SWAYSOCK" 'output HEADLESS-1 mode --custom 1920x1080@120Hz'
+}
+
+usage() {
+    cat <<EOF
+Usage: $0 {start|stop|status|vnc-restart|120hz|screenshot [path]|game [x11|wayland]|viewer [--control]|pointer-test|click X Y|replay [recording] [--speed X] [--dry-run]|automate [options]}
+
+Commands:
+  start         Start private headless Sway and localhost-only WayVNC
+  stop          Stop WayVNC and Sway; keep logs for review
+  status        Show Sway output/socket and WayVNC status
+  vnc-restart   Restart only WayVNC with the configured 120 FPS capture limit
+  120hz         Apply 1920x1080@120Hz to the running headless output
+  screenshot    Save a screenshot from HEADLESS-1 (default: runtime preview.png)
+  game          Launch Sober inside Sway (default: XWayland to match the normal X11 desktop; 'game wayland' opts in to native Wayland)
+  viewer        Open view-only VNC by default; --control enables viewer input
+  pointer-test  Send one small relative pointer move to test the private session
+  click X Y     Send one absolute left click through private XWayland XTest
+  replay        Replay a libinput YAML macro only inside this private session
+  automate      Run image-triggered Phase 1/2 farming loop with skip/retry/heal handling
+
+Override the automatically selected Intel render node with AOTR_RENDER_NODE.
+EOF
+}
+
+command_name="${1:-help}"
+shift || true
+case "$command_name" in
+    start) start_session ;;
+    stop) stop_session ;;
+    status) show_status ;;
+    vnc-restart) restart_wayvnc ;;
+    120hz) set_refresh_120 ;;
+    screenshot) take_screenshot "${1:-}" ;;
+    game) launch_game "${1:-x11}" ;;
+    viewer) open_viewer "$@" ;;
+    pointer-test) pointer_test ;;
+    click) click_at "$@" ;;
+    replay) replay_macro "$@" ;;
+    automate) run_automation "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac
