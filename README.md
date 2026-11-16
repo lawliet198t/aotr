@@ -67,6 +67,37 @@ matching and the legacy JSON path (`opencv-python`, `mss`, `numpy`, `pynput`).
 The native input capture uses system `libinput-tools`; native replay uses the
 `evdev` Python package. The existing `.venv` already has `evdev` installed.
 
+## Headless Sober automation
+
+The optional headless setup runs Sober inside a private Sway session, with a
+1920×1080 virtual display and separate input. Automation reads screenshots
+through localhost WayVNC, detects the configured phase and UI images, and sends
+macro input and absolute clicks through private XWayland. See
+[`headless/TESTING.md`](headless/TESTING.md) for system requirements and setup.
+
+Build the input helper, then start the session and game:
+
+```bash
+make -C headless
+./headless/aotr-headless start
+./headless/aotr-headless game
+```
+
+In separate terminals, open the viewer and start automation:
+
+```bash
+./headless/aotr-headless viewer
+./headless/aotr-headless automate
+```
+
+The viewer is view-only by default. Use `viewer --control` only when you want
+its keyboard and mouse input sent to the game. Automation uses the existing
+Phase 1 and Phase 2 recordings and trigger images under `data/`; Phase 2 stays
+locked. Skip, Retry, and Heal handling and loop summaries are enabled. For a
+single click or macro replay, use `./headless/aotr-headless click X Y` or
+`./headless/aotr-headless replay data/recordings/1.yml`. Stop the private
+session with `./headless/aotr-headless stop`.
+
 ## Standalone C player
 
 `play.c` plus the `play-c` Makefile target provide a standalone C two-phase
