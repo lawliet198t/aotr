@@ -26,7 +26,7 @@ from pynput.mouse import Button, Controller as PynputMouseController
 try:
     from evdev import InputDevice, ecodes, list_devices
     _EVDEV_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     InputDevice = None
     ecodes = None
     list_devices = None
@@ -38,7 +38,7 @@ try:
     sys.path.insert(0, str(Path(__file__).parent))
     import fast_capture as _fc
     _FC_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     _fc = None
     _FC_AVAILABLE = False
     import mss  # fallback
@@ -48,6 +48,62 @@ DATA_DIR = Path("data")
 START_DIR = DATA_DIR / "start"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 STOP_IMAGE_DEFAULT = DATA_DIR / "stop.png"
+
+
+def set_windows_dpi_awareness() -> None:
+    """Keep MSS screen pixels and pynput pointer coordinates in the same space."""
+    if os.name != "nt":
+        return
+    try:
+        # Per-monitor v2 awareness is available on current Windows releases.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+set_windows_dpi_awareness()
+
+
+def enable_overlay_clickthrough(root: Any) -> None:
+    """Make the status HUD ignore mouse input on Windows or X11."""
+    if os.name == "nt":
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = int(root.winfo_id())
+            get_style = user32.GetWindowLongW
+            get_style.argtypes = [ctypes.c_void_p, c_int]
+            get_style.restype = c_long = ctypes.c_long
+            set_style = user32.SetWindowLongW
+            set_style.argtypes = [ctypes.c_void_p, c_int, c_long]
+            set_style.restype = c_long
+            ex_style = get_style(hwnd, -20)  # GWL_EXSTYLE
+            user32.SetWindowLongW(hwnd, -20, ex_style | 0x00080000 | 0x00000020 | 0x00000080)
+            # WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+        except Exception:
+            pass
+        return
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+        xfixes = ctypes.cdll.LoadLibrary("libXfixes.so.3")
+        x11.XOpenDisplay.restype = c_void_p
+        dpy = x11.XOpenDisplay(None)
+        if dpy:
+            xfixes.XFixesSetWindowShapeRegion.argtypes = [
+                c_void_p, c_ulong, c_int, c_int, c_int, c_ulong
+            ]
+            xfixes.XFixesSetWindowShapeRegion(dpy, root.winfo_id(), 2, 0, 0, 0)
+            x11.XFlush(dpy)
+            x11.XCloseDisplay(dpy)
+    except Exception:
+        pass
 
 
 def xinput_device_id(name: str) -> Optional[int]:
@@ -401,7 +457,7 @@ class RawMouseListener:
 
     @property
     def is_available(self) -> bool:
-        return _EVDEV_AVAILABLE or self._is_xinput_available
+        return _EVDEV_AVAILABLE or self._is_xinput_available or os.name == "nt"
 
     @property
     def backend_name(self) -> str:
@@ -411,6 +467,8 @@ class RawMouseListener:
             return "XInput2 raw listener"
         if self.proc:
             return "xinput raw listener"
+        if getattr(self, "_pynput_listener", None) is not None:
+            return "pynput mouse listener"
         return "unavailable"
 
     def _c_click_cb(self, btn: int, pressed: int) -> None:
@@ -443,6 +501,42 @@ class RawMouseListener:
                 return True
             except Exception:
                 pass  # fall through to subprocess fallback
+
+        # pynput supplies a portable global mouse hook on Windows and macOS.
+        # The XInput2/evdev paths remain preferred on Linux because they can
+        # distinguish physical motion from this program's synthetic input.
+        if os.name == "nt":
+            try:
+                from pynput import mouse as pynput_mouse
+
+                self._last_pynput_position = None
+
+                def on_move(x, y):
+                    current = (int(x), int(y))
+                    previous = self._last_pynput_position
+                    self._last_pynput_position = current
+                    if previous is not None and self.on_move:
+                        dx, dy = current[0] - previous[0], current[1] - previous[1]
+                        if dx or dy:
+                            self.on_move(float(dx), float(dy))
+
+                def on_click(_x, _y, button, pressed):
+                    if self.on_click:
+                        name = getattr(button, "name", str(button).split(".")[-1])
+                        self.on_click(name, bool(pressed))
+
+                def on_scroll(_x, _y, dx, dy):
+                    if self.on_scroll:
+                        self.on_scroll(int(dx), int(dy))
+
+                self._pynput_listener = pynput_mouse.Listener(
+                    on_move=on_move, on_click=on_click, on_scroll=on_scroll
+                )
+                self._pynput_listener.start()
+                self.running = True
+                return True
+            except Exception:
+                self._pynput_listener = None
 
         return False
 
@@ -659,6 +753,13 @@ class RawMouseListener:
 
     def stop(self) -> None:
         self.running = False
+        pynput_listener = getattr(self, "_pynput_listener", None)
+        if pynput_listener is not None:
+            pynput_listener.stop()
+            if pynput_listener.is_alive():
+                pynput_listener.join(timeout=0.5)
+            self._pynput_listener = None
+            return
         if self._using_evdev:
             # Closing the descriptors wakes select/read immediately.
             for dev in self._evdev_devices:

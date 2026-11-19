@@ -18,7 +18,6 @@ import json
 import argparse
 import threading
 import multiprocessing as mp
-import ctypes
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +37,8 @@ from utils import (
     START_DIR,
     RECORDINGS_DIR,
     STOP_IMAGE_DEFAULT,
+    enable_overlay_clickthrough,
+    set_windows_dpi_awareness,
 )
 from libinput_backend import (
     LibinputUnavailableError,
@@ -49,6 +50,8 @@ from libinput_backend import (
     stop_recording as stop_libinput_recording,
     sudo_warmup,
 )
+
+IS_WINDOWS = os.name == "nt"
 
 
 def _overlay_process_target(state_queue: mp.Queue):
@@ -89,22 +92,7 @@ def _overlay_process_target(state_queue: mp.Queue):
         label.pack(expand=True, fill="both")
         root.update_idletasks()
 
-        # Enable X11 click-through (all mouse clicks pass through directly to the game)
-        try:
-            x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
-            xfixes = ctypes.cdll.LoadLibrary("libXfixes.so.3")
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            dpy = x11.XOpenDisplay(None)
-            if dpy:
-                xfixes.XFixesSetWindowShapeRegion.argtypes = [
-                    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
-                    ctypes.c_int, ctypes.c_int, ctypes.c_ulong
-                ]
-                xfixes.XFixesSetWindowShapeRegion(dpy, root.winfo_id(), 2, 0, 0, 0)
-                x11.XFlush(dpy)
-                x11.XCloseDisplay(dpy)
-        except Exception:
-            pass
+        enable_overlay_clickthrough(root)
 
         def check_queue():
             try:
@@ -199,11 +187,12 @@ class InputRecorder:
             self.stop_image_paths = [Path(stop_image_path)]
         self.stop_image_path = self.stop_image_paths[0]
 
-        self.recording_path = RECORDINGS_DIR / f"{self.name}.yml"
+        recording_suffix = ".json" if IS_WINDOWS else ".yml"
+        self.recording_path = RECORDINGS_DIR / f"{self.name}{recording_suffix}"
         self.metadata_path = RECORDINGS_DIR / f"{self.name}.meta.json"
         self.input_devices = list(input_devices or [])
         self.libinput_process: Optional[subprocess.Popen] = None
-        self.partial_recording_path = self.recording_path.with_name(f".{self.name}.partial.yml")
+        self.partial_recording_path = self.recording_path.with_name(f".{self.name}.partial{recording_suffix}")
 
         # Continuous loop tracking
         self.record_count = 0
@@ -248,16 +237,20 @@ class InputRecorder:
         """Called when start frame matches."""
         if self.recording_started:
             return
-        try:
-            self.partial_recording_path.unlink(missing_ok=True)
-            self.libinput_process = start_libinput_recording(
-                self.partial_recording_path, self.input_devices
-            )
-        except (OSError, LibinputUnavailableError) as exc:
-            print(f"\n[!] Could not start libinput recording: {exc}")
-            self.abort_requested = True
-            self.stop_event.set()
-            return
+        self.partial_recording_path.unlink(missing_ok=True)
+        if not IS_WINDOWS:
+            try:
+                self.libinput_process = start_libinput_recording(
+                    self.partial_recording_path, self.input_devices
+                )
+            except (OSError, LibinputUnavailableError) as exc:
+                print(f"\n[!] Could not start libinput recording: {exc}")
+                self.abort_requested = True
+                self.stop_event.set()
+                return
+        else:
+            with self.events_lock:
+                self.events.clear()
         self.start_time = time.perf_counter()
         self.recording_started = True
         self.recording_finished = False
@@ -342,6 +335,9 @@ class InputRecorder:
     def on_key_release(self, key: Any) -> None:
         if not self.recording_started or self.recording_finished:
             return
+        if self.stop_reason in ("Manual exit key (Esc)", "Manual stop key (F12)"):
+            if key in (Key.esc, Key.f12):
+                return
 
         elapsed = time.perf_counter() - self.start_time
         self._log_event({
@@ -442,7 +438,7 @@ class InputRecorder:
         # Esc exits the recorder, but libinput records the physical key in
         # parallel before it receives the stop signal. Keep that control key
         # out of playback so it cannot abort the player on the next run.
-        if self.stop_reason == "Manual exit key (Esc)":
+        if not IS_WINDOWS and self.stop_reason == "Manual exit key (Esc)":
             removed = remove_key_events(self.partial_recording_path, key_code=1)
             if removed:
                 print(f"[+] Removed the recorder's final Esc stop frame ({removed} frame(s)).")
@@ -453,6 +449,58 @@ class InputRecorder:
         total_duration = 0.0
         if self.start_time:
             total_duration = time.perf_counter() - self.start_time
+
+        if IS_WINDOWS:
+            with self.events_lock:
+                events = list(self.events)
+            frame_count = len(events)
+            if frame_count < 10:
+                print(
+                    f"[!] Incomplete capture ({frame_count} events); keeping any existing "
+                    "recording and discarding this partial take."
+                )
+                self.partial_recording_path.unlink(missing_ok=True)
+                self.overlay.set_recording(False)
+                return
+
+            metadata = {
+                "name": self.name,
+                "created_at": datetime.now().isoformat(),
+                "duration_seconds": round(total_duration, 6),
+                "event_frames": frame_count,
+                "stop_reason": self.stop_reason,
+                "start_image": str(self.start_image_path),
+                "stop_images": [str(p) for p in self.stop_image_paths],
+                "input_devices": [],
+                "mouse_mode": "relative pynput deltas",
+                "platform": "Windows",
+            }
+            payload = {"metadata": metadata, "events": events}
+            temp_path = self.partial_recording_path
+            try:
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, separators=(",", ":"))
+                    f.flush()
+                    os.fsync(f.fileno())
+                temp_path.replace(self.recording_path)
+            except OSError as exc:
+                print(f"[!] Could not save Windows recording: {exc}")
+                temp_path.unlink(missing_ok=True)
+                self.overlay.set_recording(False)
+                return
+
+            self.overlay.set_recording(False)
+            self.record_count += 1
+            print("\n" + "=" * 60)
+            print(f"       RECORDING #{self.record_count} SAVED")
+            print("=" * 60)
+            print(f"  Sequence Name  : {self.name}")
+            print(f"  Duration       : {total_duration:.2f} seconds")
+            print(f"  Events         : {frame_count}")
+            print(f"  Stop Trigger   : {self.stop_reason}")
+            print(f"  Input Recording: {self.recording_path}")
+            print("=" * 60)
+            return
 
         frame_count = count_event_frames(self.partial_recording_path)
         recorded_duration = recording_duration_seconds(self.partial_recording_path)
@@ -571,8 +619,22 @@ class InputRecorder:
         )
         self.kb_listener.start()
 
-        print("[+] Mouse and keyboard capture: libinput kernel event recorder.")
-        print(f"[+] Devices: {', '.join(self.input_devices)}")
+        if IS_WINDOWS:
+            try:
+                self.pynput_mouse_listener = mouse.Listener(
+                    on_move=self.on_pynput_mouse_move,
+                    on_click=self.on_pynput_mouse_click,
+                    on_scroll=self.on_pynput_mouse_scroll,
+                )
+                self.pynput_mouse_listener.start()
+            except Exception as exc:
+                print(f"[!] Could not start the Windows mouse listener: {exc}")
+                self.abort_requested = True
+                self.stop_event.set()
+            print("[+] Windows input capture: pynput keyboard and mouse listeners; saving portable JSON.")
+        else:
+            print("[+] Mouse and keyboard capture: libinput kernel event recorder.")
+            print(f"[+] Devices: {', '.join(self.input_devices)}")
 
         # Load start templates
         start_templates = self._load_start_templates()
@@ -715,14 +777,20 @@ def main():
     parser.add_argument("--stop-delay", type=float, default=0.5, help="Seconds to wait after start before checking stop condition (default: 0.5)")
     parser.add_argument("--monitor", type=int, default=1, help="Monitor index to capture (default: 1 = primary)")
     parser.add_argument("--event-device", action="append", dest="input_devices", default=None,
-                        help="evdev device path to record (repeat for mouse and keyboard); otherwise select detected devices")
+                        help="Linux evdev device path (repeat for keyboard and mouse); Windows selects pynput automatically")
     args = parser.parse_args()
+    set_windows_dpi_awareness()
 
-    try:
-        sudo_warmup()
-        input_devices = choose_devices(args.input_devices)
-    except LibinputUnavailableError as exc:
-        parser.error(str(exc))
+    if IS_WINDOWS:
+        if args.input_devices:
+            parser.error("--event-device is Linux-only; Windows records through pynput automatically.")
+        input_devices = []
+    else:
+        try:
+            sudo_warmup()
+            input_devices = choose_devices(args.input_devices)
+        except LibinputUnavailableError as exc:
+            parser.error(str(exc))
 
     # Automatic phase defaults
     seq_name = args.name

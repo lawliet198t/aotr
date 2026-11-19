@@ -12,6 +12,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 
 import cv2
 import numpy as np
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from replay import read_macro  # noqa: E402
 from x11_click import XTestClicker  # noqa: E402
 from sway_seat import SwaySeat  # noqa: E402
+from video_recorder import VideoSegment  # noqa: E402
 
 DEFAULTS = {
     "p1": ROOT / "data/recordings/1.yml",
@@ -36,6 +38,7 @@ DEFAULTS = {
     "completed": ROOT / "data/completed.png",
     "failed": ROOT / "data/failed.png",
 }
+FAILED_VIDEO_DIR = ROOT / "data/recordings/failed-loops"
 
 KEY_2 = 3
 
@@ -271,50 +274,39 @@ class Automation:
         self.result = "UNKNOWN"
         self.abort = False
         self.skip_visible = self.retry_visible = self.heal_visible = False
-        self.retry_position = (1154, 847)
         self.retry_handled = False
         self.skip_since = self.retry_since = None
         self.retry_clear_since = None
         self.next_skip_click = self.next_retry_click = 0.0
         self.next_heal_click = 0.0
         self.heal_actions: list[tuple[int, int]] = []
+        self.heal_action_index = 0
         self.heal_actions_done = False
+        self.heal_final_click_pending = False
+        self.heal_final_active = False
+        self.retry_heal_attempted = False
+        self.retry_heal_fallback_active = False
         self.ui_clear_since: float | None = None
         self.phase_fallback: float | None = None
         self.next_key2 = None
+        self.key2_fallback_started_at: float | None = None
+        self.mouse_fallback_active = False
+        self.next_mouse_fallback_click = 0.0
         self.mission_tracking = False
         self.result_scores = {"COMPLETED": 0.0, "FAILED": 0.0}
         self.last_progress = 0.0
         self.loops: list[tuple[int, str, float]] = []
+        self.video_segment: VideoSegment | None = None
+        self.video_segments: list[VideoSegment] = []
+        self.video_finalize_threads: list[Thread] = []
+        self.phase1_video_attempted = False
 
-    def _button_match(self, label: str, x: int, y: int
-                      ) -> tuple[bool, float, tuple[int, int] | None]:
+    def _button_match(self, label: str, x: int, y: int) -> tuple[bool, float]:
         h, w = self.frame.shape[:2]
         x1, y1 = max(0, x - 320), max(0, y - 220)
         x2, y2 = min(w, x + 320), min(h, y + 220)
-        matched, score = match_template(
+        return match_template(
             self.frame, self.images[label], self.args.threshold, (x1, y1, x2, y2))
-
-        # RFB mouse positions use framebuffer coordinates. Find the matched
-        # button center in that same framebuffer, rather than assuming the
-        # source game's desktop coordinates still describe this sandbox.
-        crop = self.frame[y1:y2, x1:x2]
-        template = self.images[label]
-        ch, cw = crop.shape[:2]
-        th, tw = template.shape[:2]
-        if ch < th or cw < tw:
-            return matched, score, None
-        small_crop = cv2.resize(crop, (cw // 2, ch // 2), interpolation=cv2.INTER_AREA)
-        small_template = cv2.resize(template, (max(8, tw // 2), max(8, th // 2)),
-                                    interpolation=cv2.INTER_AREA)
-        if (small_template.shape[0] > small_crop.shape[0]
-                or small_template.shape[1] > small_crop.shape[1]):
-            return matched, score, None
-        result = cv2.matchTemplate(small_crop, small_template, cv2.TM_CCOEFF_NORMED)
-        _min_score, _max_score, _min_loc, max_loc = cv2.minMaxLoc(result)
-        center_x = x1 + (max_loc[0] + small_template.shape[1] / 2) * 2
-        center_y = y1 + (max_loc[1] + small_template.shape[0] / 2) * 2
-        return matched, score, (round(center_x), round(center_y))
 
     def _phase_match(self, phase: str, threshold: float) -> tuple[str | None, float]:
         best_name, best_score = None, 0.0
@@ -338,6 +330,10 @@ class Automation:
             self.result = result
 
     def _start_macro(self, name: str) -> None:
+        if name == "2":
+            # Phase 1's repeated-2/mouse fallback is only for the wait before
+            # Phase 2. Do not let any queued fallback action leak into Phase 2.
+            self._cancel_phase1_fallback("Phase 2 started")
         payload, _frames, _events, duration = self.macros[name]
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(self.input_path))
@@ -367,7 +363,84 @@ class Automation:
             self.phase1_duration = 0.0
             self.phase2_duration = 0.0
             self.next_key2 = None
+            self.key2_fallback_started_at = None
+            self.mouse_fallback_active = False
+            self.next_mouse_fallback_click = 0.0
         print(f"\n[PHASE {name}] Playing macro {name} ({duration:.2f}s, {len(payload)} bytes).", flush=True)
+
+    def _start_video_segment(self, phase: str) -> None:
+        if self.video_segment is not None:
+            self._stop_video_segment("phase transition")
+        try:
+            segment = VideoSegment(FAILED_VIDEO_DIR, self.loop + 1, phase)
+        except (OSError, RuntimeError) as exc:
+            print(f"[VIDEO] Could not start isolated 720p/30 recording: {exc}", flush=True)
+            return
+        self.video_segment = segment
+        self.video_segments.append(segment)
+        print(f"[VIDEO] Recording private WayVNC frames at 1280x720, 30 FPS ({phase}).", flush=True)
+
+    def _stop_video_segment(self, reason: str) -> None:
+        segment = self.video_segment
+        if segment is None:
+            return
+        segment.request_stop()
+        self.video_segment = None
+        print(f"[VIDEO] Stopped {segment.phase} capture on {reason}; waiting for loop result.", flush=True)
+
+    def _update_video_capture(self, new_frame: bool) -> None:
+        now = time.monotonic()
+        if self.video_segment is not None and (self.skip_visible or self.retry_visible):
+            self._stop_video_segment("SKIP" if self.skip_visible else "RETRY")
+        run = self.run
+        if (self.video_segment is None and not self.phase1_video_attempted
+                and run is not None and run.name == "1"
+                and now - run.started >= 70.0
+                and not self.skip_visible and not self.retry_visible):
+            self.phase1_video_attempted = True
+            self._start_video_segment("phase1")
+        if (new_frame and self.video_segment is not None
+                and not self.skip_visible and not self.retry_visible
+                and self.vnc.pixels is not None):
+            self.video_segment.submit(self.vnc.pixels)
+
+    def _resolve_loop_videos(self, result: str) -> None:
+        if self.video_segment is not None:
+            self._stop_video_segment("RETRY")
+        segments, self.video_segments = self.video_segments, []
+        loop_number = self.loop + 1
+        self.phase1_video_attempted = False
+        if not segments:
+            return
+
+        print(f"[VIDEO] Finalizing {len(segments)} clip(s) for loop #{loop_number} ({result}).", flush=True)
+
+        def finalize() -> None:
+            saved: list[Path] = []
+            for segment in segments:
+                if result == "FAILED":
+                    destination = segment.save_failed()
+                    if destination is not None:
+                        saved.append(destination)
+                    else:
+                        print(f"[VIDEO] Could not finalize {segment.phase} clip; discarded it.", flush=True)
+                else:
+                    segment.discard()
+                if segment.dropped_frames:
+                    print(f"[VIDEO] {segment.phase} clip dropped {segment.dropped_frames} capture frame(s) under encoder load.", flush=True)
+            if saved:
+                print(f"[VIDEO] Loop #{loop_number} FAILED; saved {len(saved)} unique clip(s) in {FAILED_VIDEO_DIR}:", flush=True)
+                for path in saved:
+                    print(f"  {path.name}", flush=True)
+            else:
+                print(f"[VIDEO] Loop #{loop_number} {result}; discarded its {len(segments)} clip(s).", flush=True)
+
+        self.video_finalize_threads = [
+            thread for thread in self.video_finalize_threads if thread.is_alive()
+        ]
+        thread = Thread(target=finalize, name=f"VideoFinalize-{loop_number}", daemon=True)
+        self.video_finalize_threads.append(thread)
+        thread.start()
 
     def _stop_macro(self) -> None:
         if self.run is None:
@@ -429,7 +502,10 @@ class Automation:
 
     def _tap_key2(self) -> None:
         now = time.monotonic()
-        if self.run is not None or now < (self.next_key2 or now):
+        # This fallback is armed only when Phase 1 finishes naturally. A
+        # macro stopped by a detected Skip leaves next_key2 unset and proceeds
+        # directly through the normal Phase 2 transition.
+        if self.run is not None or self.next_key2 is None or now < self.next_key2:
             return
         # The input service schedules a short startup lead-in for each
         # request. Anchor the next tap to this one so that lead-in does not
@@ -448,13 +524,46 @@ class Automation:
             client.recv(64)
         finally:
             client.close()
-        print("[PHASE 1] No trigger/Skip yet; tapping 2.", flush=True)
+        if self.key2_fallback_started_at is None:
+            self.key2_fallback_started_at = time.monotonic()
+            print("[PHASE 1] Started the repeated-2 fallback; mouse fallback begins after 5s while waiting for Phase 2.", flush=True)
+
+    def _cancel_phase1_fallback(self, reason: str) -> None:
+        was_active = (self.next_key2 is not None
+                      or self.key2_fallback_started_at is not None
+                      or self.mouse_fallback_active)
+        self.next_key2 = None
+        self.key2_fallback_started_at = None
+        self.mouse_fallback_active = False
+        self.next_mouse_fallback_click = 0.0
+        if was_active:
+            print(f"[FALLBACK] Phase 1 key/mouse fallback stopped ({reason}).", flush=True)
+
+    def _mouse_fallback_step(self, now: float, new_frame: bool) -> None:
+        if (self.state != "WAIT_P2" or self.skip_visible or self.retry_visible
+                or self.run is not None):
+            return
+        started_at = self.key2_fallback_started_at
+        if started_at is None or now - started_at < 5.0:
+            return
+        if not self.mouse_fallback_active:
+            self.mouse_fallback_active = True
+            self.next_mouse_fallback_click = now
+            print("[FALLBACK] Moving mouse down and clicking left every 100 ms while waiting for Phase 2.", flush=True)
+        if new_frame:
+            # One relative pixel per captured frame produces steady downward
+            # movement without choosing a screen coordinate.
+            self.clicker.move_relative(0, 1)
+        if now >= self.next_mouse_fallback_click:
+            self.clicker.click_current(.01)
+            self.next_mouse_fallback_click = now + .1
 
     def _finish_loop(self) -> None:
         # A loop ends only on Retry, whose shared result screen is expected to
         # show either Completed or Failed. Preserve that invariant in logs even
         # when a threshold missed both templates by a small amount.
         self._classify_result(force=True)
+        self._resolve_loop_videos(self.result)
         elapsed = time.monotonic() - self.loop_started
         self.loop += 1
         self.loops.append((self.loop, self.result, elapsed))
@@ -467,15 +576,21 @@ class Automation:
         self.mission_tracking = False
         self.state = "WAIT_P1"
         self.phase_fallback = None
+        self._cancel_phase1_fallback("loop reset")
+        self.next_key2 = None
 
     def _screens(self, gray: np.ndarray) -> None:
         self.frame = gray
         now = time.monotonic()
         # Heal takes precedence over Retry on the shared result screen.
-        self.heal_visible, heal_score, _heal_position = self._button_match("heal", 1863, 73)
-        self.retry_visible, retry_score, retry_position = self._button_match("retry", 1154, 847)
-        self.skip_visible, skip_score, _skip_position = self._button_match("skip", 1802, 1028)
-        if self.skip_visible or self.retry_visible or self.heal_visible:
+        self.heal_visible, heal_score = self._button_match("heal", 1863, 70)
+        self.retry_visible, retry_score = self._button_match("retry", 1154, 847)
+        self.skip_visible, skip_score = self._button_match("skip", 1802, 1028)
+        if self.skip_visible or self.retry_visible:
+            self._cancel_phase1_fallback(
+                "Skip detected" if self.skip_visible else "Retry detected")
+        if (self.skip_visible or self.retry_visible or self.heal_visible
+                or self.heal_final_active or self.retry_heal_fallback_active):
             self.ui_clear_since = None
             if not self.sway_seat.constraints_disabled:
                 self.sway_seat.set_pointer_constraints(False)
@@ -495,7 +610,10 @@ class Automation:
 
         if self.heal_visible and not self.heal_actions_done and not self.heal_actions:
             self.heal_actions = [(668, 890), (668, 890), (1193, 280), (1193, 280)]
+            self.heal_action_index = 0
             self.next_heal_click = now
+            self.heal_final_click_pending = False
+            self.heal_final_active = True
             print(f"\n[AUTO] HEAL detected ({heal_score:.3f}); running heal clicks.", flush=True)
         if self.skip_visible and self.skip_since is None:
             self.skip_since = now
@@ -505,10 +623,8 @@ class Automation:
             self.next_skip_click = 0.0
         if self.retry_visible and self.retry_since is None:
             self.retry_since = now
-            if retry_position is not None:
-                self.retry_position = retry_position
             self.retry_clear_since = None
-            print(f"\n[AUTO] RETRY detected ({retry_score:.3f}); fixed target {self.retry_position}, every 100 ms.", flush=True)
+            print(f"\n[AUTO] RETRY detected ({retry_score:.3f}); clicking hardcoded coordinates (1154, 847) every 100 ms.", flush=True)
         elif self.retry_visible:
             self.retry_clear_since = None
         elif self.retry_since is not None:
@@ -516,41 +632,73 @@ class Automation:
             # it only after the button has stayed gone for half a second.
             if self.retry_clear_since is None:
                 self.retry_clear_since = now
-            elif now - self.retry_clear_since >= .5:
+            elif (now - self.retry_clear_since >= .5
+                  and not (self.retry_heal_fallback_active
+                           and (not self.heal_actions_done
+                                or self.heal_final_click_pending))):
                 self.retry_since = None
                 self.retry_clear_since = None
                 self.next_retry_click = 0.0
                 self.retry_handled = False
+                self.retry_heal_attempted = False
+                self.retry_heal_fallback_active = False
+                self.heal_final_active = False
+
+        if (self.retry_visible and self.retry_since is not None
+                and now - self.retry_since >= 5.0 and not self.retry_heal_attempted):
+            self.retry_heal_attempted = True
+            self.retry_heal_fallback_active = True
+            self.heal_actions = [(668, 890), (668, 890), (1193, 280), (1193, 280)]
+            self.heal_action_index = 0
+            self.heal_actions_done = False
+            self.heal_final_click_pending = False
+            self.heal_final_active = True
+            self.next_heal_click = now
+            print("\n[AUTO] RETRY stayed visible for 5 seconds; running the Heal sequence instead of moving the Retry click.", flush=True)
 
     def _button_actions(self, now: float) -> None:
         """Run click cadences independently of framebuffer damage/update rate."""
 
-        if self.heal_visible:
+        if (self.heal_visible or self.retry_heal_fallback_active
+                or self.heal_final_active):
             if not self.heal_actions_done:
                 if now >= self.next_heal_click and self.heal_actions:
                     x, y = self.heal_actions.pop(0)
+                    self.heal_action_index += 1
+                    print(f"[HEAL] Setup click {self.heal_action_index}/4 at ({x}, {y}).", flush=True)
                     self._click(x, y)
                     self.next_heal_click = now + .5
                     if not self.heal_actions:
                         self.heal_actions_done = True
-                        self.next_heal_click = now + .5
-            elif not self.retry_visible and now >= self.next_heal_click:
-                self._click(1863, 73)
+                        self.heal_final_click_pending = True
+                        self.next_heal_click = now
+            elif (self.heal_final_click_pending or not self.retry_visible
+                  or self.retry_heal_fallback_active) and now >= self.next_heal_click:
+                if self.heal_final_click_pending:
+                    print("[HEAL] Starting final click loop at (1863, 70), every 200 ms.", flush=True)
+                self._click(1863, 70)
+                self.heal_final_click_pending = False
                 self.next_heal_click = now + .2
+                if self.retry_visible and not self.retry_heal_fallback_active:
+                    self.heal_final_active = False
+            elif self.retry_visible and not self.retry_heal_fallback_active:
+                self.heal_final_active = False
         elif not self.retry_visible:
             self.heal_actions_done = False
             self.heal_actions.clear()
+            self.heal_final_click_pending = False
+            self.heal_final_active = False
 
         if self.skip_visible:
             if now >= self.next_skip_click:
                 self._click(1802, 1028)
                 self.next_skip_click = now + .1
 
-        if self.retry_visible:
+        if self.retry_visible and not self.retry_heal_fallback_active:
             if (now >= self.next_retry_click
-                    and (not self.heal_visible or self.heal_actions_done)):
-                click_x, click_y = self.retry_position
-                self._click(click_x, click_y)
+                    and (not self.heal_visible or self.heal_actions_done)
+                    and not self.heal_final_click_pending):
+                self._click(1154, 847)
                 self.next_retry_click = now + .1
                 self._classify_result(force=True)
 
@@ -567,6 +715,7 @@ class Automation:
             return
         if frame is not None:
             self._screens(frame)
+        self._update_video_capture(frame is not None)
         if self.frame is None:
             return
 
@@ -626,6 +775,10 @@ class Automation:
             if not self.skip_visible:
                 self._tap_key2()
 
+        # Mouse fallback is confined to the Phase 1 -> Phase 2 wait. It is
+        # canceled on Skip/Retry and before Phase 2 starts.
+        self._mouse_fallback_step(time.monotonic(), frame is not None)
+
     def run_forever(self) -> None:
         p1_frames = self.macros["1"][1]
         p2_frames = self.macros["2"][1]
@@ -635,6 +788,7 @@ class Automation:
         print(f" Phase 1: {self.args.phase1} ({p1_frames} frames, threshold {self.args.phase1_threshold:.2f})")
         print(f" Phase 2: {self.args.phase2} ({p2_frames} frames, threshold {self.args.phase2_threshold:.2f}; locked)")
         print(" Skip/Retry: auto-click every 100ms | Heal: priority sequence, final click every 200ms")
+        print(" Video: private WayVNC frames at 720p/30; Phase 1 only, starts at 70s; failed loops only")
         print(" Phase fallback: start macro 1s after Skip if its trigger image is absent")
         print(" Ctrl+C stops automation and releases macro inputs")
         print("=" * 60, flush=True)
@@ -644,9 +798,18 @@ class Automation:
         except KeyboardInterrupt:
             print("\n[!] Stopping headless automation...", flush=True)
         finally:
+            # Stop playback first so a video flush cannot keep gameplay input
+            # running after Ctrl+C.
             self._stop_macro()
             self.clicker.close()
             self.sway_seat.close()
+            if self.video_segment is not None:
+                self._stop_video_segment("automation stopped")
+            for segment in self.video_segments:
+                segment.discard()
+            self.video_segments.clear()
+            for thread in self.video_finalize_threads:
+                thread.join()
             self.vnc.close()
             print("\nSESSION SUMMARY")
             print(f"Loops completed: {self.loop}")
@@ -665,7 +828,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heal-image", dest="heal_image", default=str(DEFAULTS["heal"]))
     parser.add_argument("--completed-image", dest="completed_image", default=str(DEFAULTS["completed"]))
     parser.add_argument("--failed-image", dest="failed_image", default=str(DEFAULTS["failed"]))
-    parser.add_argument("--phase1-threshold", type=float, default=.80)
+    parser.add_argument("--phase1-threshold", type=float, default=.85)
     parser.add_argument("--phase2-threshold", type=float, default=.70)
     parser.add_argument("--threshold", type=float, default=.80)
     parser.add_argument("--speed", type=float, default=1.0)

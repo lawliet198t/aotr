@@ -13,7 +13,7 @@ On Ubuntu/Mint, install the session and inspection tools yourself:
 
 ```bash
 sudo apt update
-sudo apt install sway wayvnc grim wtype wlrctl tigervnc-viewer \
+sudo apt install sway wayvnc grim wtype wlrctl tigervnc-viewer ffmpeg \
   build-essential libx11-dev libxtst-dev
 ```
 
@@ -195,14 +195,33 @@ CPU/bandwidth headroom while keeping detection latency below about 17 ms. The
 headless output itself remains at 120 Hz. It uses
 `data/start/1` at threshold `0.80` and `data/start/2` at
 `0.70`, then plays `data/recordings/1.yml` and `2.yml`. Phase 2 is locked.
-Skip and Retry are detected from the private display and clicked every 100 ms.
-Retry resets the cycle to Phase 1. If Skip advances the game but the next
-phase trigger does not appear, that phase macro starts after one second. During
-the post-Phase-1 wait, if neither Skip nor a Phase 2 trigger appears for five
-seconds, it taps `2` every 500 ms. Heal handling runs before Retry handling,
-performs the configured coordinate sequence, then repeats the final Heal click
-every 200 ms until Retry appears. Each loop summary reports the detected
-mission result.
+Skip and Retry are detected from the private display and clicked at fixed
+coordinates every 100 ms; the Retry click never moves. If Retry remains visible
+for five seconds, automation runs the Heal sequence instead of shifting the
+Retry target. Its final click repeats every 200 ms until Retry clears. Retry
+resets the cycle to Phase 1. If Skip advances the game but the next
+phase trigger does not appear, that phase macro starts after one second. If the
+Phase 1 macro ends naturally without Skip and no Phase 2 trigger appears for
+five seconds, it taps `2` every 500 ms. A Phase 1 macro stopped by a detected
+Skip skips the `2` and mouse fallbacks. Five seconds after the first fallback tap,
+the mouse moves down by one pixel per captured frame and left-clicks at its
+current position every 100 ms while waiting for Phase 2. Both fallbacks stop
+when Skip or Retry is detected, or when Phase 2 starts. When the Heal image
+appears, automation performs the configured coordinate sequence and repeats
+its final click every 200 ms until
+Retry is detected. Each loop summary reports the detected mission result.
+
+Video capture uses the same private WayVNC framebuffer as image detection,
+never the host desktop. It starts 70 seconds after Phase 1 macro playback
+begins and stops on Skip or Retry. It records Phase 1 only. Clips are 1280×720
+at 30 FPS;
+ffmpeg runs at reduced CPU priority with a single ultrafast H.264 encoder
+thread, while frames pass through a small bounded queue so the input/detection
+loop never waits for encoding. A temporary clip is kept only until Retry
+classifies the loop. Only clips from loops detected as `FAILED` are moved into
+`data/recordings/failed-loops/`, with unique names. Completed or unclassified
+loop clips are deleted. If the Phase 1 macro ends before 70 seconds, that
+loop has no Phase 1 clip.
 
 Press Ctrl+C to stop automation; the input service releases held keys/buttons
 and remains available. Paths, thresholds, and speed can be overridden with

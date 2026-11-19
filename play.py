@@ -14,7 +14,6 @@ import sys
 import time
 import json
 import subprocess
-import ctypes
 import threading
 import multiprocessing as mp
 import argparse
@@ -39,6 +38,8 @@ from utils import (
     serialize_button,
     START_DIR,
     RECORDINGS_DIR,
+    enable_overlay_clickthrough,
+    set_windows_dpi_awareness,
 )
 from libinput_backend import (
     LibinputUnavailableError,
@@ -58,6 +59,7 @@ from libinput_backend import (
 )
 
 XTEST_SLAVE_ID_FALLBACK = 4
+IS_WINDOWS = os.name == "nt"
 
 DEFAULT_RETRY_IMG = Path("data/retry.png")
 DEFAULT_SKIP_IMG = Path("data/skip.png")
@@ -77,7 +79,7 @@ def _overlay_process_target(state_queue: mp.Queue):
         root = tk.Tk()
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.85)
+        root.attributes("-alpha", 0.80)
 
         w, h = 180, 38
         sw = root.winfo_screenwidth()
@@ -94,21 +96,7 @@ def _overlay_process_target(state_queue: mp.Queue):
         label.pack(expand=True, fill="both")
         root.update_idletasks()
 
-        try:
-            x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
-            xfixes = ctypes.cdll.LoadLibrary("libXfixes.so.3")
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            dpy = x11.XOpenDisplay(None)
-            if dpy:
-                xfixes.XFixesSetWindowShapeRegion.argtypes = [
-                    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
-                    ctypes.c_int, ctypes.c_int, ctypes.c_ulong
-                ]
-                xfixes.XFixesSetWindowShapeRegion(dpy, root.winfo_id(), 2, 0, 0, 0)
-                x11.XFlush(dpy)
-                x11.XCloseDisplay(dpy)
-        except Exception:
-            pass
+        enable_overlay_clickthrough(root)
 
         log_lines = []
         countdown_deadline = None
@@ -465,8 +453,9 @@ class InputPlayer:
         p = Path(p_in)
         if p.is_file():
             return p
+        suffixes = (".json", ".yml", ".yaml") if IS_WINDOWS else (".yml", ".yaml", ".json")
         if p.suffix.lower() not in {".json", ".yml", ".yaml"}:
-            for suffix in (".yml", ".yaml", ".json"):
+            for suffix in suffixes:
                 candidate = Path(str(p) + suffix)
                 if candidate.is_file():
                     return candidate
@@ -478,7 +467,7 @@ class InputPlayer:
         if alt.is_file():
             return alt
         if p.suffix.lower() not in {".json", ".yml", ".yaml"}:
-            for suffix in (".yml", ".yaml", ".json"):
+            for suffix in suffixes:
                 alt_ext = RECORDINGS_DIR / f"{p.name}{suffix}"
                 if alt_ext.is_file():
                     return alt_ext
@@ -496,7 +485,8 @@ class InputPlayer:
                 raise FileNotFoundError(f"Recordings directory not found: {dir_to_scan}")
 
             native_files = sorted(dir_to_scan.glob("*.yml")) + sorted(dir_to_scan.glob("*.yaml"))
-            json_files = native_files or sorted(dir_to_scan.glob("*.json"))
+            json_files = (sorted(dir_to_scan.glob("*.json")) if IS_WINDOWS
+                          else native_files or sorted(dir_to_scan.glob("*.json")))
             if not json_files:
                 raise FileNotFoundError(f"No supported recording files found in {dir_to_scan}")
 
@@ -743,8 +733,7 @@ class InputPlayer:
             heal_visible = False
             heal_retry_pending = False
             retry_visible_since = None
-            retry_click_y = self.retry_coords[1]
-            retry_adjustment_logged = False
+            retry_heal_attempted = False
             last_error = None
             while not self._button_watcher_stop.is_set() and not self.abort_requested:
                 try:
@@ -754,15 +743,27 @@ class InputPlayer:
                     if now >= next_result_scan:
                         next_result_scan = now + 0.25
                         self._capture_mission_result(screen_gray)
-                    if self.heal_template is not None:
-                        heal_matched, heal_score, _ = self.matcher.match(
-                            self.heal_template,
-                            screen_gray=screen_gray,
-                            threshold=self.threshold,
-                        )
+                    stuck_retry_heal = (
+                        retry_visible_since is not None
+                        and now - retry_visible_since >= 5.0
+                        and not retry_heal_attempted
+                    )
+                    if self.heal_template is not None or stuck_retry_heal:
+                        heal_matched = False
+                        heal_score = 0.0
+                        if self.heal_template is not None:
+                            heal_matched, heal_score, _ = self.matcher.match(
+                                self.heal_template,
+                                screen_gray=screen_gray,
+                                threshold=self.threshold,
+                            )
+                        if stuck_retry_heal:
+                            retry_heal_attempted = True
+                            heal_retry_pending = False
+                            print("\n[AUTO] RETRY stayed visible for 5 seconds; running the Heal sequence instead of shifting the Retry click.")
                         retry_from_heal = heal_retry_pending and heal_matched
-                        if heal_matched and not heal_retry_pending:
-                            if not heal_visible:
+                        if (heal_matched and not heal_retry_pending) or stuck_retry_heal:
+                            if not stuck_retry_heal and not heal_visible:
                                 self.overlay.log_event(f"HEAL DETECTED ({heal_score:.3f})")
                                 print(f"\n[AUTO] HEAL detected ({heal_score:.3f}); applying heal actions, then repeating the final click every 200 ms until Retry is detected.")
                             heal_visible = True
@@ -778,36 +779,41 @@ class InputPlayer:
                             if self.abort_requested or self._button_watcher_stop.is_set():
                                 break
 
-                            retry_from_heal = False
                             next_final_click = time.perf_counter()
                             while (not self.abort_requested
-                                   and not self._button_watcher_stop.is_set()
-                                   and not self._retry_detected.is_set()):
+                                   and not self._button_watcher_stop.is_set()):
+                                now = time.perf_counter()
+                                if now >= next_final_click:
+                                    self.click_screen(1863, 70, label="HEAL")
+                                    next_final_click += 0.2
+                                    if next_final_click <= time.perf_counter():
+                                        next_final_click = time.perf_counter() + 0.2
+
                                 screen_gray = self.matcher.grab_gray()
                                 now = time.perf_counter()
+                                retry_from_heal = False
                                 if self.retry_template is not None:
                                     retry_from_heal, _retry_score, _ = self.matcher.match(
                                         self.retry_template,
                                         screen_gray=screen_gray,
                                         threshold=self.threshold,
                                     )
-                                if retry_from_heal:
+                                if stuck_retry_heal:
+                                    # Retry is already visible in this recovery
+                                    # path. Keep repeating the final Heal click
+                                    # until it clears, then let the cycle proceed.
+                                    if not retry_from_heal:
+                                        retry_heal_attempted = False
+                                        heal_retry_pending = False
+                                        break
+                                elif retry_from_heal:
                                     self._capture_mission_result(screen_gray, force=True)
                                     heal_retry_pending = True
                                     next_retry = 0.0
                                     break
-
-                                if now >= next_final_click:
-                                    self.click_screen(1863, 73, label="HEAL")
-                                    next_final_click += 0.2
-                                    # Avoid a burst of clicks if one click took
-                                    # longer than the requested repeat period.
-                                    if next_final_click <= time.perf_counter():
-                                        next_final_click = time.perf_counter() + 0.2
-                                else:
-                                    self._button_watcher_stop.wait(
-                                        min(0.01, next_final_click - time.perf_counter())
-                                    )
+                                self._button_watcher_stop.wait(
+                                    min(0.01, max(0.0, next_final_click - time.perf_counter()))
+                                )
                             if self.abort_requested or self._button_watcher_stop.is_set():
                                 break
                             if self._retry_detected.is_set():
@@ -833,25 +839,17 @@ class InputPlayer:
                             self._retry_visible = True
                             if retry_visible_since is None:
                                 retry_visible_since = time.perf_counter()
-                                retry_click_y = self.retry_coords[1]
-                                retry_adjustment_logged = False
                             if now - last_retry_log >= 1.0:
-                                print(f"\n[AUTO] RETRY detected ({score:.3f}); clicking from {self.retry_coords} every 100 ms, then moving upward 1 pixel per click after 5 seconds.")
+                                print(f"\n[AUTO] RETRY detected ({score:.3f}); clicking fixed coordinates {self.retry_coords} every 100 ms.")
                                 last_retry_log = now
-                            if time.perf_counter() - retry_visible_since >= 5.0:
-                                retry_click_y = max(0, retry_click_y - 1)
-                                if not retry_adjustment_logged:
-                                    print("[AUTO] RETRY is still visible after 5 seconds; moving each retry click upward by 1 pixel.")
-                                    retry_adjustment_logged = True
                             self.click_screen(
-                                self.retry_coords[0], retry_click_y, label="RETRY"
+                                self.retry_coords[0], self.retry_coords[1], label="RETRY"
                             )
                             next_retry = time.perf_counter() + 0.1
                         else:
                             self._retry_visible = False
                             retry_visible_since = None
-                            retry_click_y = self.retry_coords[1]
-                            retry_adjustment_logged = False
+                            retry_heal_attempted = False
                     last_error = None
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"
@@ -1662,7 +1660,7 @@ class InputPlayer:
     def wait_for_retry(self) -> bool:
         """
         Watches screen for [Retry] button.
-        When detected, clicks at self.retry_coords (X=1802, Y=1028).
+        When detected, clicks the configured fixed Retry coordinates.
         """
         if self.retry_template is None:
             print("[!] Note: 'data/retry.png' not loaded, skipping retry check.")
@@ -2132,6 +2130,7 @@ def main():
         help="Allow physical input to take over Phase 1 during playback (disabled by default; Phase 2 remains locked).",
     )
     args = parser.parse_args()
+    set_windows_dpi_awareness()
 
     # Determine sequence targets
     target_sequences = []
@@ -2142,15 +2141,20 @@ def main():
     elif not args.all:
         # Check priority pairs in data/recordings/
         candidates = [
-            ("1.yml", "2.yml"),
-            ("1.json", "2.json"),
-            ("combo_phase1.yml", "combo_phase2.yml"),
+            ("1.json", "2.json"), ("1.yml", "2.yml"),
             ("combo_phase1.json", "combo_phase2.json"),
-            ("phase1.yml", "phase2.yml"),
-            ("phase1.json", "phase2.json"),
-            ("combo_1.yml", "combo_2.yml"),
-            ("combo_1.json", "combo_2.json"),
+            ("combo_phase1.yml", "combo_phase2.yml"),
+            ("phase1.json", "phase2.json"), ("phase1.yml", "phase2.yml"),
+            ("combo_1.json", "combo_2.json"), ("combo_1.yml", "combo_2.yml"),
         ]
+        if not IS_WINDOWS:
+            candidates = [
+                ("1.yml", "2.yml"), ("1.json", "2.json"),
+                ("combo_phase1.yml", "combo_phase2.yml"),
+                ("combo_phase1.json", "combo_phase2.json"),
+                ("phase1.yml", "phase2.yml"), ("phase1.json", "phase2.json"),
+                ("combo_1.yml", "combo_2.yml"), ("combo_1.json", "combo_2.json"),
+            ]
         found = False
         for f1, f2 in candidates:
             p1 = RECORDINGS_DIR / f1
@@ -2161,7 +2165,12 @@ def main():
                 break
 
         if not found:
-            for single in ["1.yml", "1.json", "combo_phase1.yml", "combo_phase1.json", "phase1.yml", "phase1.json", "combo_1.yml", "combo_1.json"]:
+            singles = ["1.json", "1.yml", "combo_phase1.json", "combo_phase1.yml",
+                       "phase1.json", "phase1.yml", "combo_1.json", "combo_1.yml"]
+            if not IS_WINDOWS:
+                singles = ["1.yml", "1.json", "combo_phase1.yml", "combo_phase1.json",
+                           "phase1.yml", "phase1.json", "combo_1.yml", "combo_1.json"]
+            for single in singles:
                 p = RECORDINGS_DIR / single
                 if p.is_file():
                     target_sequences = [str(p)]
@@ -2170,15 +2179,36 @@ def main():
         if not target_sequences:
             parser.error("Please specify sequence file(s) (e.g. 1 2 or combo_phase1 combo_phase2) or use --all.")
 
-    native_requested = args.all and (
+    native_requested = not IS_WINDOWS and args.all and (
         any(RECORDINGS_DIR.glob("*.yml")) or any(RECORDINGS_DIR.glob("*.yaml"))
     )
-    native_requested = native_requested or any(
+    native_requested = native_requested or (not IS_WINDOWS and any(
         str(item).lower().endswith((".yml", ".yaml"))
         or (RECORDINGS_DIR / f"{Path(str(item)).name}.yml").is_file()
         or (RECORDINGS_DIR / f"{Path(str(item)).name}.yaml").is_file()
         for item in target_sequences
-    )
+    ))
+    if IS_WINDOWS and any(str(item).lower().endswith((".yml", ".yaml")) for item in target_sequences):
+        parser.error("Linux-native .yml recordings cannot run on Windows; record or export the sequence as .json first.")
+    if IS_WINDOWS and args.all:
+        scan_dir = Path(args.sequences[0]) if args.sequences and Path(args.sequences[0]).is_dir() else RECORDINGS_DIR
+        if not any(scan_dir.glob("*.json")):
+            parser.error(f"No portable JSON recordings were found in {scan_dir}. Linux-native .yml recordings cannot run on Windows.")
+    if IS_WINDOWS:
+        for item in target_sequences:
+            candidate = Path(item)
+            if candidate.suffix.lower() in {"", ".json"}:
+                stems = [candidate] if candidate.suffix else [Path(str(candidate) + ".json")]
+                if candidate.suffix == ".json":
+                    continue
+                locations = stems + [RECORDINGS_DIR / stems[0].name]
+                if not any(path.is_file() for path in locations):
+                    yml_candidates = [Path(str(candidate) + suffix) for suffix in (".yml", ".yaml")]
+                    yml_candidates += [RECORDINGS_DIR / f"{candidate.name}{suffix}" for suffix in (".yml", ".yaml")]
+                    if any(path.is_file() for path in yml_candidates):
+                        parser.error(f"'{item}' only resolves to a Linux-native recording; Windows requires a .json macro.")
+    if IS_WINDOWS and args.allow_takeover:
+        parser.error("--allow-takeover is Linux-only because Windows cannot reliably separate physical input from synthetic playback input.")
     if native_requested and not args.dry_run:
         try:
             sudo_warmup()

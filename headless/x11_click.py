@@ -66,6 +66,10 @@ class XTestClicker:
             display_ptr, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong,
         ]
         self.xtst.XTestFakeMotionEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeRelativeMotionEvent.argtypes = [
+            display_ptr, ctypes.c_int, ctypes.c_int, ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeRelativeMotionEvent.restype = ctypes.c_int
         self.xtst.XTestFakeButtonEvent.argtypes = [
             display_ptr, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong,
         ]
@@ -78,11 +82,19 @@ class XTestClicker:
             raise RuntimeError("XTest absolute pointer motion failed")
         self.x11.XSync(self.display, 0)
         time.sleep(.01)
+        self.click_current(hold_seconds)
+
+    def move_relative(self, dx: int, dy: int) -> None:
+        if not self.xtst.XTestFakeRelativeMotionEvent(self.display, dx, dy, 0):
+            raise RuntimeError("XTest relative pointer motion failed")
+        self.x11.XSync(self.display, 0)
+
+    def click_current(self, hold_seconds: float = .06) -> None:
         if not self.xtst.XTestFakeButtonEvent(self.display, 1, 1, 0):
             raise RuntimeError("XTest left-button press failed")
         self.x11.XSync(self.display, 0)
         try:
-            time.sleep(hold_seconds)
+            time.sleep(max(0.0, hold_seconds))
         finally:
             self.xtst.XTestFakeButtonEvent(self.display, 1, 0, 0)
             self.x11.XSync(self.display, 0)

@@ -67,6 +67,40 @@ matching and the legacy JSON path (`opencv-python`, `mss`, `numpy`, `pynput`).
 The native input capture uses system `libinput-tools`; native replay uses the
 `evdev` Python package. The existing `.venv` already has `evdev` installed.
 
+## Windows desktop mode
+
+The Python desktop tools detect Windows automatically. Windows uses MSS for
+screen capture, pynput for keyboard/mouse input, and portable JSON recordings;
+Linux keeps the existing libinput/uinput native YAML path. Native `.yml`
+recordings cannot be replayed on Windows, so record the phases on Windows or
+use JSON recordings copied into `data/recordings/`.
+
+In PowerShell, from the project folder:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install opencv-python mss numpy pynput
+.\.venv\Scripts\python.exe record.py --phase 1
+.\.venv\Scripts\python.exe record.py --phase 2
+.\.venv\Scripts\python.exe play.py 1 2
+```
+
+Quick-time prompts use `data/a.png`, `data/s.png`, `data/d.png`, and
+`data/w.png`:
+
+```powershell
+.\.venv\Scripts\python.exe qte.py
+```
+
+`capture_tool.py` and `mouse_coords.py` use the portable Python backends too.
+Windows macro movement is based on desktop pointer deltas; games that require
+raw, device-level relative input may behave differently from Linux native
+playback. Use `recording_editor.py` to edit JSON macros on Windows; its Play
+button is a visual keyboard-timeline preview and does not send game input.
+`--allow-takeover`, the standalone `play-c` binary, the GTK C editor, and the
+headless Sway tools remain Linux-only. Windows execution has not been
+validated on a Windows machine.
+
 ## Headless Sober automation
 
 The optional headless setup runs Sober inside a private Sway session, with a
@@ -93,10 +127,27 @@ In separate terminals, open the viewer and start automation:
 The viewer is view-only by default. Use `viewer --control` only when you want
 its keyboard and mouse input sent to the game. Automation uses the existing
 Phase 1 and Phase 2 recordings and trigger images under `data/`; Phase 2 stays
-locked. Skip, Retry, and Heal handling and loop summaries are enabled. For a
+locked. Skip, Retry, and Heal handling and loop summaries are enabled. Retry
+clicks stay at fixed coordinates; when Retry remains visible for five seconds,
+automation runs the Heal sequence rather than moving the Retry target. The final
+Heal click repeats every 200 ms until Retry clears. For a
 single click or macro replay, use `./headless/aotr-headless click X Y` or
 `./headless/aotr-headless replay data/recordings/1.yml`. Stop the private
-session with `./headless/aotr-headless stop`.
+session with `./headless/aotr-headless stop`. If the Phase 1 macro finishes
+naturally without Skip, automation waits five seconds for a Phase 2 trigger,
+then taps `2` every 500 ms. Five seconds after its first tap, the mouse moves
+down continuously and left-clicks at the current pointer position every 100 ms
+while waiting for Phase 2. Both fallbacks stop immediately when Skip or Retry
+is detected, or when Phase 2 starts. A Phase 1 macro stopped by a detected Skip
+goes directly to the normal Phase 2 transition without starting these fallbacks.
+Automation also records the same private WayVNC framebuffer used for detection
+at 1280×720 and 30 FPS, using a low-priority, single-thread ffmpeg encoder and
+a bounded frame queue. Phase 1 recording starts 70 seconds into its macro;
+capture stops at Skip or Retry. It does not record Phase 2. A temporary clip is
+kept only until the loop result is known. Only clips from `FAILED` loops are
+saved, each with a unique name under
+`data/recordings/failed-loops/`; completed or unclassified loops are discarded.
+Install `ffmpeg` if it is not already available.
 
 ## Standalone C player
 
@@ -106,6 +157,10 @@ start Python. It reads the existing phase trigger folders and Skip, Retry,
 Heal, Completed, and Failed images. Phase 2 stays fixed at threshold `0.70`.
 The uinput keyboard does not advertise `EV_REP`: it replays repeat events from
 the recording without adding kernel-generated repeats for held keys.
+Retry clicks use fixed coordinates. If Retry remains visible for five seconds,
+the C player runs the Heal sequence, then repeats its final click every 200 ms
+until Retry clears. A normal Heal detection repeats the final click until Retry
+is detected.
 
 Build and run from the repository root:
 
